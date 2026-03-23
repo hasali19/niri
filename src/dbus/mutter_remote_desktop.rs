@@ -12,22 +12,20 @@ use enumflags2::BitFlags;
 use futures_util::lock::Mutex;
 use serde::{Deserialize, Serialize};
 use smithay::backend::input::{AxisSource, InputTime, KeyState, Keycode};
-use smithay::utils::{Logical, Point, Rectangle, Size};
-use zbus::fdo;
+use smithay::utils::{Logical, Point};
 #[cfg(feature = "xdp-gnome-screencast")]
 use zbus::object_server::InterfaceRef;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{self, DeserializeDict, OwnedObjectPath, SerializeDict, Type};
-use zbus::{interface, ObjectServer};
+use zbus::{fdo, interface, ObjectServer};
 
 use super::{request_name, Start};
-use crate::backend::IpcOutputMap;
-use crate::input::remote_desktop_backend::{
+use crate::input::dbus_remote_desktop_backend::{
     RdAbsolutePosition, RdEventAdapter, RdInputBackend, RdKeyboardKeyEvent, RdPointerAxisEvent,
     RdPointerButtonEvent, RdPointerMotionAbsoluteEvent, RdPointerMotionEvent, RdTouchEvent,
     UnitIntervalPointKind,
 };
-use crate::utils::RemoteDesktopSessionId;
+use crate::utils::{global_bounding_rectangle_ipc, RemoteDesktopSessionId};
 
 #[cfg(feature = "xdp-gnome-screencast")]
 pub(super) mod shared {
@@ -230,22 +228,7 @@ impl Session {
         x: f64,
         y: f64,
     ) -> fdo::Result<Point<f64, UnitIntervalPointKind>> {
-        fn global_bounding_rectangle(
-            ipc_outputs: &IpcOutputMap,
-        ) -> Option<Rectangle<i32, Logical>> {
-            ipc_outputs
-                .values()
-                .filter_map(|output| output.logical)
-                .fold(None, |acc, l| {
-                    let geo = Rectangle::new(
-                        Point::new(l.x, l.y),
-                        Size::new(l.width as i32, l.height as i32),
-                    );
-                    Some(acc.map_or(geo, |acc| acc.merge(geo)))
-                })
-        }
-
-        let in_point = Point::<f64, Logical>::new(x, y);
+        let point_rel = Point::<f64, Logical>::new(x, y);
 
         let Some((screen_cast_iface, screen_cast_object_server)) = &self.screen_cast_session else {
             return Err(fdo::Error::Failed(
@@ -266,21 +249,24 @@ impl Session {
             Point::new(params.position.0, params.position.1)
         };
 
+        // absolute position in the global bounding rectangle, in logical pixels
+        let point_abs = stream_position.to_f64() + point_rel;
+
         let Some(output_geo) = ({
             let screen_cast_state = screen_cast_iface.get().await;
             let ipc_outputs = screen_cast_state.ipc_outputs.lock().unwrap();
-            global_bounding_rectangle(&ipc_outputs)
+            global_bounding_rectangle_ipc(&ipc_outputs)
         }) else {
             return Err(fdo::Error::Failed(
                 "Missing outputs for getting global bounding rectangle".to_owned(),
             ));
         };
 
-        let out_point = (stream_position.to_f64() + in_point - output_geo.loc.to_f64()).to_size()
-            / output_geo.size.to_f64();
-        let out_point = Point::new(out_point.x, out_point.y);
+        let point_unit_interval =
+            (point_abs - output_geo.loc.to_f64()).to_size() / output_geo.size.to_f64();
+        let point_unit_interval = Point::new(point_unit_interval.x, point_unit_interval.y);
 
-        Ok(out_point)
+        Ok(point_unit_interval)
     }
 
     /// Stops the session.
@@ -402,7 +388,9 @@ impl Session {
         debug!("RemoteDesktop.Start id={}", self.id);
 
         if self.active {
-            return Err(fdo::Error::Failed("Already started".to_owned()));
+            return Err(fdo::Error::Failed(
+                "Unable to start the session: Already started".to_owned(),
+            ));
         }
         self.active = true;
 
@@ -424,7 +412,9 @@ impl Session {
         debug!("RemoteDesktop.Stop id={}", self.id);
 
         if !self.active {
-            return Err(fdo::Error::Failed("Session not started".to_owned()));
+            return Err(fdo::Error::Failed(
+                "Unable to stop the session: Session not started".to_owned(),
+            ));
         }
 
         self.stop(server, &ctxt).await;
