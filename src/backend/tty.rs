@@ -1617,7 +1617,9 @@ impl Tty {
             .global_space
             .outputs()
             .find(|output| {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+                let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+                    return false;
+                };
                 tty_state.node == node && tty_state.crtc == crtc
             })
             .cloned();
@@ -1697,7 +1699,9 @@ impl Tty {
             .global_space
             .outputs()
             .find(|output| {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+                let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+                    return false;
+                };
                 tty_state.node == node && tty_state.crtc == crtc
             })
             .cloned()
@@ -1892,7 +1896,10 @@ impl Tty {
             return self.render_virtual_output(niri, output, target_presentation_time);
         }
 
-        let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+            error!("missing tty output state for output {}", output.name());
+            return rv;
+        };
         let Some(device) = self.devices.get_mut(&tty_state.node) else {
             error!("missing output device");
             return rv;
@@ -1933,8 +1940,11 @@ impl Tty {
 
         // Visualize the damage, if enabled.
         if niri.debug_draw_damage {
-            let output_state = niri.output_state.get_mut(output).unwrap();
-            draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+            if let Some(output_state) = niri.output_state.get_mut(output) {
+                draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+            } else {
+                error!("missing output state for output {}", output.name());
+            }
         }
 
         // Overlay planes are disabled by default as they cause weird performance issues on my
@@ -1960,9 +1970,12 @@ impl Tty {
                 flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
             }
             if debug.skip_cursor_only_updates_during_vrr {
-                let output_state = niri.output_state.get(output).unwrap();
-                if output_state.frame_clock.vrr() {
-                    flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
+                if let Some(output_state) = niri.output_state.get(output) {
+                    if output_state.frame_clock.vrr() {
+                        flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
+                    }
+                } else {
+                    error!("missing output state for output {}", output.name());
                 }
             }
 
@@ -2000,7 +2013,10 @@ impl Tty {
 
                     match drm_compositor.queue_frame(data) {
                         Ok(()) => {
-                            let output_state = niri.output_state.get_mut(output).unwrap();
+                            let Some(output_state) = niri.output_state.get_mut(output) else {
+                                error!("missing output state for output {}", output.name());
+                                return RenderResult::Submitted;
+                            };
                             let new_state = RedrawState::WaitingForVBlank {
                                 redraw_needed: false,
                             };
@@ -2106,7 +2122,9 @@ impl Tty {
     }
 
     pub fn get_gamma_size(&self, output: &Output) -> anyhow::Result<u32> {
-        let tty_state = output.user_data().get::<TtyOutputState>().unwrap();
+        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+            anyhow::bail!("output {} is not a tty output", output.name());
+        };
         let crtc = tty_state.crtc;
 
         let device = self
@@ -2127,7 +2145,9 @@ impl Tty {
     }
 
     pub fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> anyhow::Result<()> {
-        let tty_state = output.user_data().get::<TtyOutputState>().unwrap();
+        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+            anyhow::bail!("output {} is not a tty output", output.name());
+        };
         let crtc = tty_state.crtc;
 
         let device = self
@@ -2227,7 +2247,14 @@ impl Tty {
                     .global_space
                     .outputs()
                     .find(|output| {
-                        let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+                        if VirtualOutputMarker::is_virtual(output) {
+                            return false;
+                        }
+
+                        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+                            return false;
+                        };
+
                         tty_state.node == *node && tty_state.crtc == crtc
                     })
                     .map(logical_output);
@@ -2336,7 +2363,10 @@ impl Tty {
         );
 
         // Update the frame clock so animation timing works correctly.
-        let output_state = niri.output_state.get_mut(output).unwrap();
+        let Some(output_state) = niri.output_state.get_mut(output) else {
+            error!("missing output state for output {}", output.name());
+            return RenderResult::Skipped;
+        };
         output_state.frame_clock.presented(now);
 
         // Use the estimated vblank timer to pace redraws, just like physical outputs.
@@ -2418,14 +2448,24 @@ impl Tty {
     pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
         let _span = tracy_client::span!("Tty::set_output_on_demand_vrr");
 
-        let output_state = niri.output_state.get_mut(output).unwrap();
+        if VirtualOutputMarker::is_virtual(output) {
+            return;
+        }
+
+        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+            return;
+        };
+
+        let Some(output_state) = niri.output_state.get_mut(output) else {
+            error!("missing output state for output {}", output.name());
+            return;
+        };
         output_state.on_demand_vrr_enabled = enable_vrr;
         if output_state.frame_clock.vrr() == enable_vrr {
             return;
         }
         for (&node, device) in self.devices.iter_mut() {
             for (&crtc, surface) in device.surfaces.iter_mut() {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
                 if tty_state.node == node && tty_state.crtc == crtc {
                     let word = if enable_vrr { "enabling" } else { "disabling" };
                     if let Err(err) = surface.compositor.use_vrr(enable_vrr) {
@@ -2605,7 +2645,9 @@ impl Tty {
                     .global_space
                     .outputs()
                     .find(|output| {
-                        let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+                        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+                            return false;
+                        };
                         tty_state.node == node && tty_state.crtc == crtc
                     })
                     .cloned();
@@ -3117,7 +3159,13 @@ fn queue_estimated_vblank_timer(
     output: Output,
     target_presentation_time: Duration,
 ) {
-    let output_state = niri.output_state.get_mut(&output).unwrap();
+    let Some(output_state) = niri.output_state.get_mut(&output) else {
+        error!(
+            "missing output state for estimated vblank timer for output {}",
+            output.name()
+        );
+        return;
+    };
     match mem::take(&mut output_state.redraw_state) {
         RedrawState::Idle => unreachable!(),
         RedrawState::Queued => (),
@@ -3630,8 +3678,6 @@ fn make_output_name(
         serial: info.as_ref().and_then(|info| info.serial()),
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
