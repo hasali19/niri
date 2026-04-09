@@ -244,4 +244,20 @@ impl Backend {
             panic!("backend is not Headless")
         }
     }
+
+    /// Create a new virtual output and return its name.
+    pub fn create_virtual_output(
+        &mut self,
+        niri: &mut Niri,
+        width: u16,
+        height: u16,
+        refresh_rate: u32,
+    ) -> Result<String, String> {
+        unimplemented!("creating virtual outputs is not yet implemented");
+    }
+
+    /// Remove a virtual output by name.
+    pub fn remove_virtual_output(&mut self, niri: &mut Niri, name: &str) -> Result<(), String> {
+        unimplemented!("removing virtual outputs is not yet implemented");
+    }
 }
