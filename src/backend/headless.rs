@@ -300,6 +300,33 @@ impl Headless {
         refresh_rate: u32,
         name: Option<String>,
     ) -> Result<String, String> {
+        let mut width = width;
+        let mut height = height;
+        let mut refresh_millihz = refresh_rate.saturating_mul(1000);
+        let mut should_connect = true;
+
+        if let Some(name) = name.as_deref() {
+            let lookup_name = OutputName {
+                connector: name.to_string(),
+                make: None,
+                model: None,
+                serial: None,
+            };
+            let config = niri.config.borrow();
+            if let Some(output_config) = config.outputs.find(&lookup_name) {
+                should_connect = !output_config.off;
+
+                if let Some(mode_config) = output_config.mode {
+                    width = mode_config.mode.width;
+                    height = mode_config.mode.height;
+
+                    let refresh_hz = mode_config.mode.refresh.unwrap_or(60.0);
+                    refresh_millihz =
+                        (refresh_hz * 1000.0).round().clamp(1.0, u32::MAX as f64) as u32;
+                }
+            }
+        }
+
         if let Some(name) = name.as_deref() {
             if name.trim().is_empty() {
                 return Err("virtual output name cannot be empty".to_string());
@@ -315,15 +342,12 @@ impl Headless {
             &mut self.output_counter,
             width,
             height,
-            refresh_rate,
+            refresh_millihz,
             name,
         );
 
         if self.outputs.contains_key(&built.name)
-            || niri
-                .global_space
-                .outputs()
-                .any(|o| o.name() == built.name)
+            || niri.global_space.outputs().any(|o| o.name() == built.name)
         {
             return Err(format!("output '{}' already exists", built.name));
         }
@@ -336,7 +360,13 @@ impl Headless {
         self.outputs
             .insert(built.name.clone(), (built.output.clone(), built.output_id));
 
-        niri.add_output(built.output, Some(built.refresh_interval), false);
+        if should_connect {
+            niri.add_output(built.output, Some(built.refresh_interval), false);
+        }
+
+        // Ensure IPC state matches the (potentially) configured mode and connection state.
+        niri.ipc_outputs_changed = true;
+        self.on_output_config_changed(niri);
 
         Ok(built.name)
     }

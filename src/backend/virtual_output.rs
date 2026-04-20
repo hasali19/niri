@@ -21,9 +21,9 @@ pub(super) struct BuiltVirtualOutput {
     pub ipc_output: niri_ipc::Output,
 }
 
-pub(super) fn refresh_interval_from_millihz(refresh_mhz: u64) -> Duration {
-    let refresh_mhz = refresh_mhz.max(1);
-    let interval_nanos = 1_000_000_000_000 / refresh_mhz;
+pub(super) fn refresh_interval_from_millihz(refresh_millihz: u64) -> Duration {
+    let refresh_millihz = refresh_millihz.max(1);
+    let interval_nanos = 1_000_000_000_000 / refresh_millihz;
 
     // Clamp extremely low refresh rates to a reasonable pacing interval.
     // This matches existing virtual-output code paths (off/on + mode changes).
@@ -38,10 +38,17 @@ pub(super) fn build_headless_virtual_output(
     counter: &mut u32,
     width: u16,
     height: u16,
-    refresh_rate: u32,
+    refresh_millihz: u32,
     name: Option<String>,
 ) -> BuiltVirtualOutput {
-    let refresh_rate = if refresh_rate < 2 { 60 } else { refresh_rate };
+    let refresh_millihz = if refresh_millihz < 2_000 {
+        60_000
+    } else {
+        refresh_millihz
+    };
+
+    let refresh_millihz = refresh_millihz.clamp(1, i32::MAX as u32);
+    let refresh_millihz = refresh_millihz as i32;
 
     *counter += 1;
     let n = *counter;
@@ -50,8 +57,6 @@ pub(super) fn build_headless_virtual_output(
     let make = "niri".to_string();
     let model = "virtual".to_string();
     let serial = n.to_string();
-
-    let refresh_mhz = i32::try_from(refresh_rate.saturating_mul(1000)).unwrap_or(60_000);
 
     let output = Output::new(
         connector.clone(),
@@ -66,7 +71,7 @@ pub(super) fn build_headless_virtual_output(
 
     let mode = Mode {
         size: Size::from((i32::from(width), i32::from(height))),
-        refresh: refresh_mhz.max(1),
+        refresh: refresh_millihz,
     };
     output.change_current_state(Some(mode), None, None, None);
     output.set_preferred(mode);
@@ -94,7 +99,7 @@ pub(super) fn build_headless_virtual_output(
         modes: vec![niri_ipc::Mode {
             width,
             height,
-            refresh_rate: refresh_rate * 1000,
+            refresh_rate: refresh_millihz as u32,
             is_preferred: true,
         }],
         current_mode: Some(0),
@@ -104,7 +109,7 @@ pub(super) fn build_headless_virtual_output(
         logical: Some(logical_output(&output)),
     };
 
-    let refresh_interval = refresh_interval_from_millihz(u64::from(refresh_rate) * 1000);
+    let refresh_interval = refresh_interval_from_millihz(u64::from(refresh_millihz as u32));
 
     BuiltVirtualOutput {
         name: connector,
@@ -151,13 +156,14 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
         let new_mode = output_config.and_then(|config| {
             config.mode.as_ref().map(|mode_config| {
                 let refresh_hz = mode_config.mode.refresh.unwrap_or(60.0);
-                let refresh_mhz = (refresh_hz * 1000.0).round().clamp(1.0, i32::MAX as f64) as i32;
+                let refresh_millihz =
+                    (refresh_hz * 1000.0).round().clamp(1.0, i32::MAX as f64) as i32;
                 Mode {
                     size: Size::from((
                         i32::from(mode_config.mode.width),
                         i32::from(mode_config.mode.height),
                     )),
-                    refresh: refresh_mhz,
+                    refresh: refresh_millihz,
                 }
             })
         });
@@ -197,11 +203,11 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
                 niri.ipc_outputs_changed = true;
             }
             (false, false) => {
-                let refresh_mhz = output
+                let refresh_millihz = output
                     .current_mode()
                     .map(|m| m.refresh.max(1) as u64)
                     .unwrap_or(60_000);
-                let refresh_interval = refresh_interval_from_millihz(refresh_mhz);
+                let refresh_interval = refresh_interval_from_millihz(refresh_millihz);
                 niri.add_output(output.clone(), Some(refresh_interval), false);
                 niri.ipc_outputs_changed = true;
                 resized_outputs.push(output.clone());
@@ -218,8 +224,8 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
             if let Some(new_mode) = output.current_mode() {
                 // Keep refresh pacing in sync with the new mode when connected.
                 if let Some(output_state) = niri.output_state.get_mut(output) {
-                    let refresh_mhz = new_mode.refresh.max(1) as u64;
-                    let refresh_interval = refresh_interval_from_millihz(refresh_mhz);
+                    let refresh_millihz = new_mode.refresh.max(1) as u64;
+                    let refresh_interval = refresh_interval_from_millihz(refresh_millihz);
                     output_state.frame_clock = FrameClock::new(Some(refresh_interval), false);
                 }
             }
