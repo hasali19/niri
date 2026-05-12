@@ -74,3 +74,33 @@ fn virtual_output_custom_mode_does_not_accumulate_modes() {
         assert_eq!(modes[0].size.h, 1080);
     }
 }
+
+#[test]
+fn touch_input_targets_virtual_output_when_focused() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Create a virtual output and focus it.
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(&mut state.niri, 1920, 1080, 60, Some("virt".to_owned()))
+            .unwrap()
+    };
+
+    let virt = f
+        .niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .clone();
+
+    f.niri().layout.focus_output(&virt);
+
+    // With no explicit `input.touch.map-to-output` configured, touch should follow the active
+    // output (which may be virtual).
+    let touch_output = f.niri().output_for_touch().unwrap().clone();
+    assert_eq!(touch_output, virt);
+}
