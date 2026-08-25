@@ -208,3 +208,65 @@ pub fn update_zone_output_size(output: &Output) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> ZoneRect {
+        ZoneRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn zones_cover_their_output_exactly() {
+        let size = Size::from((1920., 1080.));
+
+        let left = rect(0., 0., 0.5, 1.).resolve(size);
+        let right = rect(0.5, 0., 0.5, 1.).resolve(size);
+
+        assert_eq!(left.loc.x, 0);
+        assert_eq!(left.size.w, 960);
+        assert_eq!(right.loc.x, 960);
+        assert_eq!(left.size.w + right.size.w, 1920);
+    }
+
+    #[test]
+    fn adjacent_zones_tile_an_odd_sized_output() {
+        // 1365 doesn't divide into thirds, so rounding has to land somewhere. Rounding the shared
+        // edges rather than the widths is what keeps the zones touching.
+        let size = Size::from((1365., 768.));
+
+        let a = rect(0., 0., 1. / 3., 1.).resolve(size);
+        let b = rect(1. / 3., 0., 1. / 3., 1.).resolve(size);
+        let c = rect(2. / 3., 0., 1. / 3., 1.).resolve(size);
+
+        assert_eq!(b.loc.x, a.loc.x + a.size.w);
+        assert_eq!(c.loc.x, b.loc.x + b.size.w);
+        assert_eq!(a.size.w + b.size.w + c.size.w, 1365);
+    }
+
+    #[test]
+    fn a_zone_is_never_zero_sized() {
+        // Small enough that this zone rounds away entirely.
+        let zone = rect(0., 0., 0.001, 0.001).resolve(Size::from((100., 100.)));
+        assert_eq!(zone.size.w, 1);
+        assert_eq!(zone.size.h, 1);
+    }
+
+    #[test]
+    fn zones_can_be_stacked_vertically() {
+        let size = Size::from((1920., 1080.));
+
+        let top = rect(0., 0., 1., 0.7).resolve(size);
+        let bottom = rect(0., 0.7, 1., 0.3).resolve(size);
+
+        assert_eq!(top.size, Size::from((1920, 756)));
+        assert_eq!(bottom.loc.y, top.loc.y + top.size.h);
+        assert_eq!(top.size.h + bottom.size.h, 1080);
+    }
+}

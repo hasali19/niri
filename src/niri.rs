@@ -153,6 +153,7 @@ use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::boxed::BoxedRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -4550,6 +4551,39 @@ impl Niri {
             push(element.into());
         }
 
+        // A zoned output has no content of its own: it shows its zones. Each one renders exactly
+        // as it would on a screen of its own, then gets moved into place and clipped to its
+        // rectangle, so a client that ignores its size can't bleed into a neighbouring zone.
+        if let Some(zone_outputs) = self.zoned_outputs.get(output) {
+            for zone_output in zone_outputs {
+                let Some(geo) = zone::zone_geometry(zone_output) else {
+                    continue;
+                };
+                let geo = geo.to_f64();
+
+                self.render(ctx.r(), zone_output, false, &mut |elem| {
+                    let elem = BoxedRenderElement::new(elem);
+                    if let Some(elem) = scale_relocate_crop(elem, output_scale, 1., geo) {
+                        push(elem.into());
+                    }
+                });
+            }
+
+            // Fill whatever the zones don't cover. While locked that has to be the lock color
+            // rather than the backdrop, since it's part of the screen that must not show through.
+            let buffer = if self.is_locked() {
+                &state.lock_color_buffer
+            } else {
+                &state.backdrop_buffer
+            };
+            push(
+                SolidColorRenderElement::from_buffer(buffer, (0., 0.), 1., Kind::Unspecified)
+                    .into(),
+            );
+
+            return;
+        }
+
         // If the session is locked, draw the lock surface.
         if self.is_locked() {
             if let Some(surface) = state.lock_surface.as_ref() {
@@ -4606,15 +4640,6 @@ impl Niri {
         // Then, the Alt-Tab switcher.
         self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
-
-        // A zoned output has no monitor or layer-shell surfaces of its own; everything below this
-        // point lives on its zones instead.
-        //
-        // FIXME: composite the zones' contents in here.
-        if self.zoned_outputs.contains_key(output) {
-            push(backdrop);
-            return;
-        }
 
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
@@ -6944,5 +6969,12 @@ niri_render_elements! {
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
+        // The contents of one zone, moved into its place on the output and clipped to it. Boxed
+        // because this is `OutputRenderElements` inside `OutputRenderElements`.
+        Zone = CropRenderElement<
+            RelocateRenderElement<
+                RescaleRenderElement<BoxedRenderElement<OutputRenderElements<R>>>,
+            >,
+        >,
     }
 }
