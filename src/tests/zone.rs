@@ -254,6 +254,41 @@ fn focus_and_frame_callbacks_go_to_zones() {
 }
 
 #[test]
+fn zones_throttle_clients_on_their_displays_presentation() {
+    let mut f = Fixture::with_config(halves_config());
+    f.add_output(1, (1920, 1080));
+
+    let physical = output_named(&mut f, "headless-1");
+    let left = output_named(&mut f, "headless-1:left");
+    let right = output_named(&mut f, "headless-1:right");
+
+    // Only the display presents, so only its sequence advances.
+    f.niri()
+        .output_state
+        .get_mut(&physical)
+        .unwrap()
+        .frame_callback_sequence = 7;
+
+    // Frame callbacks to clients on a zone have to be throttled against that, not against the
+    // zone's own sequence, which never moves. Getting this wrong leaves clients stuck at the
+    // fallback timer's rate instead of the display's refresh rate.
+    assert_eq!(f.niri().presentation_sequence(&left), 7);
+    assert_eq!(f.niri().presentation_sequence(&right), 7);
+    assert_eq!(f.niri().output_state[&left].frame_callback_sequence, 0);
+
+    // An ordinary output presents for itself.
+    let mut g = Fixture::new();
+    g.add_output(1, (1920, 1080));
+    let plain = output_named(&mut g, "headless-1");
+    g.niri()
+        .output_state
+        .get_mut(&plain)
+        .unwrap()
+        .frame_callback_sequence = 3;
+    assert_eq!(g.niri().presentation_sequence(&plain), 3);
+}
+
+#[test]
 fn removing_an_output_removes_its_zones() {
     let mut f = Fixture::with_config(halves_config());
     f.add_output(1, (1920, 1080));

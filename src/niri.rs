@@ -3241,6 +3241,16 @@ impl Niri {
         self.global_space.output_geometry(output).is_some()
     }
 
+    /// Returns the frame callback sequence that throttles clients on this output.
+    ///
+    /// The sequence advances when a frame is actually presented, which happens on the output that
+    /// scans out. For a zone that is the display it is composited into: a zone never presents on
+    /// its own, so its sequence stays put, and throttling against it would starve clients of frame
+    /// callbacks after the first one.
+    pub fn presentation_sequence(&self, output: &Output) -> u32 {
+        self.output_state[zone::render_target_of(output)].frame_callback_sequence
+    }
+
     /// Converts a `WlOutput` to a corresponding `Output` if it exists.
     ///
     /// Compared to raw `Output::from_resource`, this method also verifies that the output still
@@ -5514,8 +5524,7 @@ impl Niri {
             return;
         }
 
-        let state = self.output_state.get(output).unwrap();
-        let sequence = state.frame_callback_sequence;
+        let sequence = self.presentation_sequence(output);
 
         let should_send = |surface: &WlSurface, states: &SurfaceData| {
             // Do the standard primary scanout output check. For pointer surfaces it deduplicates
