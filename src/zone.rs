@@ -13,7 +13,7 @@ use niri_config::OutputName;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
-use crate::backend::VirtualOutputMarker;
+use crate::backend::{OutputId, VirtualOutputMarker};
 use crate::utils::output_size;
 
 /// Marker inserted into a zone output's `Output::user_data()`.
@@ -25,6 +25,10 @@ pub struct ZoneOutputMarker {
     pub parent: Output,
     /// Where this zone sits in the parent output, as fractions of the parent's logical size.
     pub rect: ZoneRect,
+    /// Identifies this zone in the IPC output map.
+    ///
+    /// A zone is not a backend object, so nothing else hands out an id for it.
+    pub id: OutputId,
 }
 
 /// A zone's rectangle, as fractions of its output's logical size.
@@ -160,6 +164,7 @@ pub fn build_zone_outputs(parent: &Output, zones: &niri_config::output::Zones) -
         output.user_data().insert_if_missing(|| ZoneOutputMarker {
             parent: parent.clone(),
             rect,
+            id: OutputId::next(),
         });
 
         // Zone outputs have no scanout pipeline of their own, same as headless virtual outputs.
@@ -171,6 +176,51 @@ pub fn build_zone_outputs(parent: &Output, zones: &niri_config::output::Zones) -
     }
 
     outputs
+}
+
+/// Builds the IPC entry describing a zone output.
+///
+/// A zone is not a backend object, so no backend produces this. Its mode is derived from its
+/// output's, and it can't be reconfigured on its own, so most of the hardware-ish fields are
+/// reported as unavailable rather than copied from the output it is part of.
+pub fn ipc_output(
+    output: &Output,
+    logical: Option<niri_ipc::LogicalOutput>,
+) -> Option<niri_ipc::Output> {
+    let marker = output.user_data().get::<ZoneOutputMarker>()?;
+    let mode = output.current_mode()?;
+    let physical_properties = output.physical_properties();
+    let parent_name = marker.parent.user_data().get::<OutputName>()?;
+
+    Some(niri_ipc::Output {
+        name: output.name(),
+        make: physical_properties.make,
+        model: physical_properties.model,
+        serial: None,
+        physical_size: None,
+        modes: vec![niri_ipc::Mode {
+            width: mode.size.w as u16,
+            height: mode.size.h as u16,
+            refresh_rate: mode.refresh as u32,
+            is_preferred: true,
+        }],
+        current_mode: Some(0),
+        is_custom_mode: true,
+        vrr_supported: false,
+        vrr_enabled: false,
+        logical,
+        max_bpc: None,
+        zones: Vec::new(),
+        zone_of: Some(parent_name.connector.clone()),
+    })
+}
+
+/// Returns the id identifying this zone output in the IPC output map.
+pub fn ipc_output_id(output: &Output) -> Option<OutputId> {
+    output
+        .user_data()
+        .get::<ZoneOutputMarker>()
+        .map(|marker| marker.id)
 }
 
 /// Updates a zone output's mode and scale after its parent output changed size or scale.

@@ -69,6 +69,7 @@ pub struct Stream {
     to_niri: calloop::channel::Sender<ScreenCastToNiri>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum StreamTarget {
     // FIXME: update on scale changes and whatnot.

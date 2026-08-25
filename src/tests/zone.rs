@@ -187,6 +187,45 @@ fn zones_inherit_their_output_config() {
 }
 
 #[test]
+fn ipc_reports_zones_and_their_output() {
+    let mut f = Fixture::with_config(halves_config());
+    f.add_output(1, (1920, 1080));
+    f.niri_state().refresh_ipc_outputs();
+
+    let state = f.niri_state();
+    let ipc_outputs = state.backend.ipc_outputs();
+    let ipc_outputs = ipc_outputs.lock().unwrap();
+    let by_name = |name: &str| {
+        ipc_outputs
+            .values()
+            .find(|output| output.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from IPC outputs"))
+            .clone()
+    };
+
+    // The output is still listed — it's the user's hardware — but as something split into zones
+    // rather than as a place windows can go.
+    let physical = by_name("headless-1");
+    assert_eq!(
+        physical.zones,
+        vec!["headless-1:left", "headless-1:right"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(physical.zone_of, None);
+    assert!(physical.logical.is_none());
+
+    // The zones are listed as outputs of their own, pointing back at it.
+    let left = by_name("headless-1:left");
+    assert_eq!(left.zone_of.as_deref(), Some("headless-1"));
+    assert!(left.zones.is_empty());
+    let logical = left.logical.expect("a zone has a logical output");
+    assert_eq!(logical.width, 960);
+    assert_eq!(logical.height, 1080);
+}
+
+#[test]
 fn removing_an_output_removes_its_zones() {
     let mut f = Fixture::with_config(halves_config());
     f.add_output(1, (1920, 1080));

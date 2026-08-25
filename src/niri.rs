@@ -2126,20 +2126,66 @@ impl State {
 
         let _span = tracy_client::span!("State::refresh_ipc_outputs");
 
-        for ipc_output in self.backend.ipc_outputs().lock().unwrap().values_mut() {
-            let logical = self
-                .niri
-                .global_space
-                .outputs()
-                .find(|output| output.name() == ipc_output.name)
-                .map(logical_output);
-            ipc_output.logical = logical;
+        {
+            let ipc_outputs = self.backend.ipc_outputs();
+            let mut ipc_outputs = ipc_outputs.lock().unwrap();
+
+            // Zones are not backend objects, so nothing has put them in the map. Drop the stale
+            // ones and re-add what exists now; an output's zones change when its config does.
+            ipc_outputs.retain(|_, ipc_output| ipc_output.zone_of.is_none());
+
+            for ipc_output in ipc_outputs.values_mut() {
+                let logical = self
+                    .niri
+                    .global_space
+                    .outputs()
+                    .find(|output| output.name() == ipc_output.name)
+                    .map(logical_output);
+                ipc_output.logical = logical;
+
+                // A zoned output has no logical output of its own: it isn't in the global space,
+                // and it isn't a workspace area. Report its zones so tools can tell why.
+                ipc_output.zones = self
+                    .niri
+                    .zoned_outputs
+                    .iter()
+                    .find(|(output, _)| output.name() == ipc_output.name)
+                    .map(|(_, zone_outputs)| {
+                        zone_outputs.iter().map(|output| output.name()).collect()
+                    })
+                    .unwrap_or_default();
+            }
+
+            for zone_output in self.niri.zoned_outputs.values().flatten() {
+                let Some(id) = zone::ipc_output_id(zone_output) else {
+                    continue;
+                };
+                let logical = self
+                    .niri
+                    .global_space
+                    .outputs()
+                    .find(|output| output == &zone_output)
+                    .map(logical_output);
+                if let Some(ipc_output) = zone::ipc_output(zone_output, logical) {
+                    ipc_outputs.insert(id, ipc_output);
+                }
+            }
         }
 
         #[cfg(feature = "dbus")]
         self.niri.on_ipc_outputs_changed();
 
-        let new_config = self.backend.ipc_outputs().lock().unwrap().clone();
+        // wlr-output-management is for configuring displays. A zone isn't one: it has no mode,
+        // position or scale of its own to set, so only real outputs are advertised there.
+        let new_config = self
+            .backend
+            .ipc_outputs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, ipc_output)| ipc_output.zone_of.is_none())
+            .map(|(id, ipc_output)| (*id, ipc_output.clone()))
+            .collect();
         self.niri.output_management_state.notify_changes(new_config);
     }
 

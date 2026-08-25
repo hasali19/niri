@@ -1257,6 +1257,16 @@ pub struct Output {
     pub logical: Option<LogicalOutput>,
     /// Maximum bits per channel (bit depth), if known.
     pub max_bpc: Option<u8>,
+    /// Names of the zones this output is split into.
+    ///
+    /// Empty for an ordinary output. When non-empty, this output is not a workspace area itself:
+    /// it has no workspaces, clients cannot bind to it and input cannot reach it. Its zones, which
+    /// are outputs in their own right, are what to use instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<String>,
+    /// Name of the output this one is a zone of, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_of: Option<String>,
 }
 
 /// Output mode.

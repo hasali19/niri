@@ -2279,6 +2279,8 @@ impl Tty {
                     vrr_enabled,
                     logical,
                     max_bpc,
+                    zones: Vec::new(),
+                    zone_of: None,
                 };
 
                 ipc_outputs.insert(id, ipc_output);
@@ -2320,6 +2322,8 @@ impl Tty {
                 vrr_enabled: false,
                 logical,
                 max_bpc: None,
+                zones: Vec::new(),
+                zone_of: None,
             };
 
             ipc_outputs.insert(*output_id, ipc_output);
