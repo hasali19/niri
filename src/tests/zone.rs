@@ -226,6 +226,29 @@ fn ipc_reports_zones_and_their_output() {
 }
 
 #[test]
+fn focus_and_frame_callbacks_go_to_zones() {
+    let mut f = Fixture::with_config(halves_config());
+    f.add_output(1, (1920, 1080));
+
+    let physical = output_named(&mut f, "headless-1");
+    let left = output_named(&mut f, "headless-1:left");
+    let right = output_named(&mut f, "headless-1:right");
+
+    // Everything that picks an output to focus or step through works off this list, so it has to
+    // hold the zones rather than the output they are composited into.
+    assert_eq!(f.niri().sorted_outputs, vec![left.clone(), right.clone()]);
+
+    // Startup focus picks the first of those, and warps the cursor onto it.
+    f.niri_state().focus_default_monitor();
+    assert_eq!(f.niri().layout.active_output(), Some(&left));
+
+    // Backends notify the output they scan out, which for a zoned output is not where any of the
+    // surfaces live.
+    f.niri().send_frame_callbacks(&physical);
+    f.niri().send_frame_callbacks_for_virtual_output(&physical);
+}
+
+#[test]
 fn removing_an_output_removes_its_zones() {
     let mut f = Fixture::with_config(halves_config());
     f.add_output(1, (1920, 1080));

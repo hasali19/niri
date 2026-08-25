@@ -3008,9 +3008,14 @@ impl Niri {
             outputs.iter().map(|d| &d.name.connector)
         );
 
+        // These are the outputs the rest of niri works with: focus, directional monitor actions,
+        // IPC. A zoned output is none of those things, so it stands in for its zones here, in the
+        // place it was sorted into.
         self.sorted_outputs = outputs
             .iter()
-            .map(|Data { output, .. }| output.clone())
+            .flat_map(|Data { output, .. }| {
+                zone_outputs_or_self(&self.zoned_outputs, output).to_vec()
+            })
             .collect();
 
         for data in outputs.into_iter() {
@@ -5137,13 +5142,11 @@ impl Niri {
         //
         // However, this should probably be restricted to sending frame callbacks to more surfaces,
         // to err on the safe side.
-        // On a zoned output the surfaces belong to its zones, so they are the ones to notify.
-        for out in zone_outputs_or_self(&self.zoned_outputs, output).to_vec() {
-            if crate::backend::VirtualOutputMarker::is_virtual(&out) {
-                self.send_frame_callbacks_for_virtual_output(&out);
-            } else {
-                self.send_frame_callbacks(&out);
-            }
+        // Both of these fan out to the zones when this is a zoned output.
+        if crate::backend::VirtualOutputMarker::is_virtual(output) {
+            self.send_frame_callbacks_for_virtual_output(output);
+        } else {
+            self.send_frame_callbacks(output);
         }
 
         backend.with_primary_renderer(|renderer| {
@@ -5474,6 +5477,14 @@ impl Niri {
     pub fn send_frame_callbacks(&mut self, output: &Output) {
         let _span = tracy_client::span!("Niri::send_frame_callbacks");
 
+        // A zoned output has no surfaces of its own; they are on its zones.
+        if let Some(zone_outputs) = self.zoned_outputs.get(output).cloned() {
+            for zone_output in zone_outputs {
+                self.send_frame_callbacks(&zone_output);
+            }
+            return;
+        }
+
         let state = self.output_state.get(output).unwrap();
         let sequence = state.frame_callback_sequence;
 
@@ -5575,6 +5586,14 @@ impl Niri {
     /// deduplication.
     pub fn send_frame_callbacks_for_virtual_output(&mut self, output: &Output) {
         let _span = tracy_client::span!("Niri::send_frame_callbacks_for_virtual_output");
+
+        // A zoned output has no surfaces of its own; they are on its zones.
+        if let Some(zone_outputs) = self.zoned_outputs.get(output).cloned() {
+            for zone_output in zone_outputs {
+                self.send_frame_callbacks_for_virtual_output(&zone_output);
+            }
+            return;
+        }
 
         let frame_callback_time = get_monotonic_time();
 
@@ -5713,32 +5732,36 @@ impl Niri {
             );
         }
 
-        for mapped in self.layout.windows_for_output(output) {
-            mapped.window.take_presentation_feedback(
-                &mut feedback,
-                surface_primary_scanout_output,
-                |surface, _| {
-                    surface_presentation_feedback_flags_from_states(
-                        surface,
-                        None,
-                        render_element_states,
-                    )
-                },
-            )
-        }
+        // On a zoned output the windows and layer surfaces belong to its zones, since that is
+        // what clients bind to.
+        for out in zone_outputs_or_self(&self.zoned_outputs, output) {
+            for mapped in self.layout.windows_for_output(out) {
+                mapped.window.take_presentation_feedback(
+                    &mut feedback,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        surface_presentation_feedback_flags_from_states(
+                            surface,
+                            None,
+                            render_element_states,
+                        )
+                    },
+                )
+            }
 
-        for surface in layer_map_for_output(output).layers() {
-            surface.take_presentation_feedback(
-                &mut feedback,
-                surface_primary_scanout_output,
-                |surface, _| {
-                    surface_presentation_feedback_flags_from_states(
-                        surface,
-                        None,
-                        render_element_states,
-                    )
-                },
-            );
+            for surface in layer_map_for_output(out).layers() {
+                surface.take_presentation_feedback(
+                    &mut feedback,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        surface_presentation_feedback_flags_from_states(
+                            surface,
+                            None,
+                            render_element_states,
+                        )
+                    },
+                );
+            }
         }
 
         if let Some(surface) = &self.output_state[output].lock_surface {

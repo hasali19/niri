@@ -212,10 +212,9 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
             }
         }
 
-        let was_connected = niri
-            .global_space
-            .outputs()
-            .any(|o| o.name() == *output_name);
+        // Whether niri is tracking this output. Not the same as being in the global space: a
+        // zoned output is connected and rendered, but only its zones go in the global space.
+        let was_connected = niri.output_state.keys().any(|o| o.name() == *output_name);
 
         // Handle off/on by removing/adding the output from/to the space.
         match (is_off, was_connected) {
@@ -236,10 +235,7 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
             _ => {}
         }
 
-        let is_connected = niri
-            .global_space
-            .outputs()
-            .any(|o| o.name() == *output_name);
+        let is_connected = niri.output_state.keys().any(|o| o.name() == *output_name);
 
         if mode_changed && !is_off && is_connected {
             if let Some(new_mode) = output.current_mode() {
@@ -256,7 +252,12 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
 
         if let Some(ipc_outputs) = ipc_outputs {
             if let Some(ipc_output) = ipc_outputs.lock().unwrap().get_mut(output_id) {
-                ipc_output.logical = is_connected.then(|| logical_output(output));
+                // A zoned output has no logical output of its own; its zones do.
+                ipc_output.logical = niri
+                    .global_space
+                    .outputs()
+                    .any(|o| o.name() == *output_name)
+                    .then(|| logical_output(output));
             }
         }
     }
