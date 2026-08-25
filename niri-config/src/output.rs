@@ -8,6 +8,7 @@ use knuffel::Decode;
 use niri_ipc::{ConfiguredMode, HSyncPolarity, Transform, VSyncPolarity};
 
 use crate::gestures::HotCorners;
+use crate::utils::Percent;
 use crate::{Color, FloatOrInt, LayoutPart};
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -80,6 +81,8 @@ pub struct Output {
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
     pub layout: Option<LayoutPart>,
+    #[knuffel(child)]
+    pub zones: Option<Zones>,
 }
 
 impl Output {
@@ -114,8 +117,42 @@ impl Default for Output {
             backdrop_color: None,
             hot_corners: None,
             layout: None,
+            zones: None,
         }
     }
+}
+
+/// Subdivision of a single physical output into independent workspace areas.
+///
+/// When an output has zones, the physical output itself stops acting as a workspace area: it gets
+/// no `wl_output` global, no workspaces of its own, and cannot be targeted by input. Instead, each
+/// zone gets its own output, with its own workspaces, and they are all composited into the
+/// physical output's image.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Zones {
+    pub zones: Vec<Zone>,
+}
+
+/// One rectangular area of a zoned output.
+///
+/// The rectangle is expressed as a fraction of the output's logical size, so it follows the output
+/// across mode and scale changes.
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct Zone {
+    /// Name of this zone, unique within its output.
+    ///
+    /// The zone's output is named `"<output-connector>:<zone-name>"`. That is the name to use for
+    /// `open-on-output`, for layer-shell clients, and in `niri msg`.
+    #[knuffel(argument)]
+    pub name: String,
+    #[knuffel(property, str)]
+    pub x: Percent,
+    #[knuffel(property, str)]
+    pub y: Percent,
+    #[knuffel(property, str)]
+    pub width: Percent,
+    #[knuffel(property, str)]
+    pub height: Percent,
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +421,120 @@ macro_rules! ensure {
             });
         }
     };
+}
+
+impl<S: ErrorSpan> Decode<S> for Zones {
+    fn decode_node(node: &SpannedNode<S>, ctx: &mut Context<S>) -> Result<Self, DecodeError<S>> {
+        if let Some(type_name) = &node.type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+
+        for span in node.properties.keys() {
+            ctx.emit_error(DecodeError::unexpected(
+                span,
+                "property",
+                format!("unexpected property `{}`", span.escape_default()),
+            ));
+        }
+
+        for value in &node.arguments {
+            ctx.emit_error(DecodeError::unexpected(
+                &value.literal,
+                "argument",
+                "no arguments expected for this node",
+            ));
+        }
+
+        let mut zones: Vec<Zone> = Vec::new();
+
+        for child in node.children() {
+            let name = &**child.node_name;
+            if name != "zone" {
+                ctx.emit_error(DecodeError::unexpected(
+                    child,
+                    "node",
+                    format!(
+                        "unexpected node `{}`, expected `zone`",
+                        name.escape_default()
+                    ),
+                ));
+                continue;
+            }
+
+            let zone: Zone = knuffel::Decode::decode_node(child, ctx)?;
+
+            let mut valid = true;
+            let mut invalid = |ctx: &mut Context<S>, msg: String| {
+                valid = false;
+                ctx.emit_error(DecodeError::Conversion {
+                    span: child.span().clone(),
+                    source: msg.into(),
+                });
+            };
+
+            for (label, value) in [
+                ("x", zone.x.0),
+                ("y", zone.y.0),
+                ("width", zone.width.0),
+                ("height", zone.height.0),
+            ] {
+                if !value.is_finite() {
+                    invalid(ctx, format!("{label} must be a finite percentage"));
+                }
+            }
+
+            if zone.width.0 <= 0. || zone.height.0 <= 0. {
+                invalid(
+                    ctx,
+                    String::from("zone width and height must be greater than 0%"),
+                );
+            }
+
+            if zone.x.0 < 0. || zone.y.0 < 0. {
+                invalid(ctx, String::from("zone x and y must not be negative"));
+            }
+
+            if zone.x.0 + zone.width.0 > 1. || zone.y.0 + zone.height.0 > 1. {
+                invalid(
+                    ctx,
+                    String::from("zone must not extend past the edge of the output"),
+                );
+            }
+
+            if zones.iter().any(|other| other.name == zone.name) {
+                invalid(
+                    ctx,
+                    format!("duplicate zone name `{}`", zone.name.escape_default()),
+                );
+            }
+
+            if zone.name.is_empty() {
+                invalid(ctx, String::from("zone name must not be empty"));
+            }
+
+            // Zone names go into the zone output's name, after a ':' separator.
+            if zone.name.contains(':') {
+                invalid(ctx, String::from("zone name must not contain ':'"));
+            }
+
+            if valid {
+                zones.push(zone);
+            }
+        }
+
+        if zones.is_empty() {
+            ctx.emit_error(DecodeError::Conversion {
+                span: node.span().clone(),
+                source: "expected at least one `zone`".into(),
+            });
+        }
+
+        Ok(Zones { zones })
+    }
 }
 
 impl<S: ErrorSpan> Decode<S> for Modeline {
