@@ -5180,18 +5180,23 @@ impl Niri {
             return;
         }
 
-        let current = self.layout.windows_for_output(output).any(|mapped| {
-            mapped.rules().variable_refresh_rate == Some(true) && {
-                let mut visible = false;
-                mapped.window.with_surfaces(|surface, states| {
-                    if !visible
-                        && surface_primary_scanout_output(surface, states).as_ref() == Some(output)
-                    {
-                        visible = true;
-                    }
-                });
-                visible
-            }
+        // On a zoned output the windows are on its zones, but VRR is a property of the output that
+        // actually scans out, so any zone asking for it turns it on for the whole display.
+        let outputs = zone_outputs_or_self(&self.zoned_outputs, output).to_vec();
+        let current = outputs.iter().any(|out| {
+            self.layout.windows_for_output(out).any(|mapped| {
+                mapped.rules().variable_refresh_rate == Some(true) && {
+                    let mut visible = false;
+                    mapped.window.with_surfaces(|surface, states| {
+                        if !visible
+                            && surface_primary_scanout_output(surface, states).as_ref() == Some(out)
+                        {
+                            visible = true;
+                        }
+                    });
+                    visible
+                }
+            })
         });
 
         backend.set_output_on_demand_vrr(self, output, current);
@@ -5246,6 +5251,20 @@ impl Niri {
             );
         }
 
+        // On a zoned output the windows and layer surfaces belong to its zones, and the zone is
+        // what they must be recorded against: that is the output frame callbacks are sent for.
+        // The elements keep their ids through the compositing wrappers, so the states recorded
+        // while rendering the output still identify them.
+        for out in zone_outputs_or_self(&self.zoned_outputs, output) {
+            self.update_primary_scanout_output_for(out, render_element_states);
+        }
+    }
+
+    fn update_primary_scanout_output_for(
+        &self,
+        output: &Output,
+        render_element_states: &RenderElementStates,
+    ) {
         // We're only updating the current output's windows and layer surfaces. This should be fine
         // as in niri they can only be rendered on a single output at a time.
         //
@@ -5391,6 +5410,16 @@ impl Niri {
         render_element_states: &RenderElementStates,
     ) {
         let _span = tracy_client::span!("Niri::send_dmabuf_feedbacks");
+
+        // On a zoned output the windows and layer surfaces belong to its zones. The feedback is
+        // the same either way — it describes the GPU that renders them, which is the one driving
+        // the output — but the surfaces can only be found through the zones.
+        if let Some(zone_outputs) = self.zoned_outputs.get(output) {
+            for zone_output in zone_outputs {
+                self.send_dmabuf_feedbacks(zone_output, feedback, render_element_states);
+            }
+            return;
+        }
 
         // We can unconditionally send the current output's feedback to regular and layer-shell
         // surfaces, as they can only be displayed on a single output at a time. Even if a surface

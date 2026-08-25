@@ -1,6 +1,7 @@
 use niri_config::output::{Zone, Zones};
 use niri_config::utils::Percent;
 use niri_config::Config;
+use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::Color32F;
 use smithay::output::Output;
 
@@ -243,9 +244,13 @@ fn focus_and_frame_callbacks_go_to_zones() {
     assert_eq!(f.niri().layout.active_output(), Some(&left));
 
     // Backends notify the output they scan out, which for a zoned output is not where any of the
-    // surfaces live.
+    // surfaces live. All of these look up windows and layer surfaces, so all of them have to
+    // reach the zones rather than the output that has none.
+    let states = RenderElementStates::default();
     f.niri().send_frame_callbacks(&physical);
     f.niri().send_frame_callbacks_for_virtual_output(&physical);
+    f.niri().update_primary_scanout_output(&physical, &states);
+    f.niri().take_presentation_feedbacks(&physical, &states);
 }
 
 #[test]
