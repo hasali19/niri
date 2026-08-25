@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{env, mem, thread};
+use std::{env, mem, slice, thread};
 
 use _server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationsMode;
 use anyhow::{bail, ensure, Context};
@@ -145,7 +145,6 @@ use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
-use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
@@ -185,6 +184,7 @@ use crate::utils::{
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
+use crate::{niri_render_elements, zone};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
@@ -258,6 +258,12 @@ pub struct Niri {
     pub blocker_cleared_rx: Receiver<Client>,
 
     pub output_state: HashMap<Output, OutputState>,
+
+    /// Zone outputs of every physical output that is split into zones.
+    ///
+    /// A zoned physical output is not a workspace area itself: it has no global, no monitor, and
+    /// is not mapped into `global_space`. Its zones are, and they are composited into its image.
+    pub zoned_outputs: HashMap<Output, Vec<Output>>,
 
     // When false, we're idling with monitors powered off.
     pub monitors_active: bool,
@@ -451,7 +457,16 @@ pub struct DndIcon {
 }
 
 pub struct OutputState {
-    pub global: GlobalId,
+    /// The `wl_output` global, if this output has one.
+    ///
+    /// Zoned physical outputs don't: clients bind to their zones instead.
+    pub global: Option<GlobalId>,
+
+    /// Where this output sits in the global space, if it is a zoned physical output.
+    ///
+    /// Those are not mapped into `global_space` (only their zones are), so there is nowhere else
+    /// to read their position back from.
+    pub zoned_position: Option<Point<i32, Logical>>,
     pub frame_clock: FrameClock,
     pub redraw_state: RedrawState,
     pub on_demand_vrr_enabled: bool,
@@ -1794,47 +1809,125 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Rebuilds the zones of every output whose `zones` config changed.
+    ///
+    /// Zone outputs are recreated rather than mutated in place, because a zone that gained or lost
+    /// area is, for clients bound to it, a different screen.
+    fn reload_zones_config(&mut self) {
+        let outputs = self
+            .niri
+            .output_state
+            .keys()
+            .filter(|output| !zone::is_zone_output(output))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for output in outputs {
+            let name = output.user_data().get::<OutputName>().unwrap();
+            let config = self.niri.config.borrow();
+            let desired = config
+                .outputs
+                .find(name)
+                .and_then(|c| c.zones.clone())
+                .filter(|zones| !zones.zones.is_empty());
+            drop(config);
+
+            let current = self.niri.zoned_outputs.get(&output).map(|zone_outputs| {
+                zone_outputs
+                    .iter()
+                    .filter_map(|zone_output| {
+                        let marker = zone_output.user_data().get::<zone::ZoneOutputMarker>()?;
+                        let name = zone_output.user_data().get::<OutputName>()?;
+                        Some((name.connector.clone(), marker.rect))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let desired_zones = desired.as_ref().map(|zones| {
+                zones
+                    .zones
+                    .iter()
+                    .map(|zone| {
+                        (
+                            zone::zone_output_name(&name.connector, &zone.name),
+                            zone::ZoneRect::from_config(zone),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            if current == desired_zones {
+                continue;
+            }
+
+            debug!("rebuilding zones of output {}", name.connector);
+
+            // Recreating the output is what flips it between zoned and unzoned: add_output() is
+            // where the global, the monitor and the zones are all decided.
+            let state = &self.niri.output_state[&output];
+            let refresh_interval = state.frame_clock.refresh_interval();
+            let vrr = state.frame_clock.vrr();
+
+            self.niri.remove_output(&output);
+            self.niri.add_output(output, refresh_interval, vrr);
+            self.niri.ipc_outputs_changed = true;
+        }
+    }
+
     pub fn reload_output_config(&mut self) {
         self.create_virtual_outputs_from_config();
+        self.reload_zones_config();
 
         let mut resized_outputs = vec![];
         let mut recolored_outputs = vec![];
 
-        for output in self.niri.global_space.outputs() {
+        // Zoned outputs are not in the global space, but their scale, transform and backdrop still
+        // apply: they are the ones that get rendered.
+        let outputs = self
+            .niri
+            .global_space
+            .outputs()
+            .chain(self.niri.zoned_outputs.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for output in &outputs {
             let name = output.user_data().get::<OutputName>().unwrap();
             let full_config = self.niri.config.borrow_mut();
             let config = full_config.outputs.find(name);
 
-            let scale = config
-                .and_then(|c| c.scale)
-                .map(|s| s.0)
-                .unwrap_or_else(|| {
-                    let size_mm = output.physical_properties().size;
-                    let resolution = output.current_mode().unwrap().size;
-                    guess_monitor_scale(size_mm, resolution)
-                });
-            let scale = closest_representable_scale(scale.clamp(0.1, 10.));
+            // A zone's scale and transform come from the output it is part of, not from config.
+            if !zone::is_zone_output(output) {
+                let scale = config
+                    .and_then(|c| c.scale)
+                    .map(|s| s.0)
+                    .unwrap_or_else(|| {
+                        let size_mm = output.physical_properties().size;
+                        let resolution = output.current_mode().unwrap().size;
+                        guess_monitor_scale(size_mm, resolution)
+                    });
+                let scale = closest_representable_scale(scale.clamp(0.1, 10.));
 
-            let mut transform = panel_orientation(output)
-                + config
-                    .map(|c| ipc_transform_to_smithay(c.transform))
-                    .unwrap_or(Transform::Normal);
-            // FIXME: fix winit damage on other transforms.
-            if name.connector == "winit" {
-                transform = Transform::Flipped180;
-            }
+                let mut transform = panel_orientation(output)
+                    + config
+                        .map(|c| ipc_transform_to_smithay(c.transform))
+                        .unwrap_or(Transform::Normal);
+                // FIXME: fix winit damage on other transforms.
+                if name.connector == "winit" {
+                    transform = Transform::Flipped180;
+                }
 
-            if output.current_scale().fractional_scale() != scale
-                || output.current_transform() != transform
-            {
-                output.change_current_state(
-                    None,
-                    Some(transform),
-                    Some(output::Scale::Fractional(scale)),
-                    None,
-                );
-                self.niri.ipc_outputs_changed = true;
-                resized_outputs.push(output.clone());
+                if output.current_scale().fractional_scale() != scale
+                    || output.current_transform() != transform
+                {
+                    output.change_current_state(
+                        None,
+                        Some(transform),
+                        Some(output::Scale::Fractional(scale)),
+                        None,
+                    );
+                    self.niri.ipc_outputs_changed = true;
+                    resized_outputs.push(output.clone());
+                }
             }
 
             let mut backdrop_color = config
@@ -2594,6 +2687,7 @@ impl Niri {
             global_space: Space::default(),
             sorted_outputs: Vec::default(),
             output_state: HashMap::new(),
+            zoned_outputs: HashMap::new(),
             unmapped_windows: HashMap::new(),
             unmapped_layer_surfaces: HashSet::new(),
             mapped_layer_surfaces: HashMap::new(),
@@ -2775,6 +2869,26 @@ impl Niri {
     }
 
     /// Repositions all outputs, optionally adding a new output.
+    /// Returns where an output sits in the global space, if it has been placed.
+    ///
+    /// Zoned physical outputs are not mapped into the global space, so their position is tracked
+    /// alongside instead.
+    pub fn output_position(&self, output: &Output) -> Option<Point<i32, Logical>> {
+        if self.zoned_outputs.contains_key(output) {
+            return self.output_state.get(output).and_then(|s| s.zoned_position);
+        }
+
+        self.global_space.output_geometry(output).map(|geo| geo.loc)
+    }
+
+    /// Returns the area an output occupies in the global space.
+    ///
+    /// Unlike `global_space.output_geometry()`, this also works for zoned physical outputs.
+    pub fn output_geometry(&self, output: &Output) -> Option<Rectangle<i32, Logical>> {
+        let loc = self.output_position(output)?;
+        Some(Rectangle::new(loc, output_size(output).to_i32_round()))
+    }
+
     pub fn reposition_outputs(&mut self, new_output: Option<&Output>) {
         let _span = tracy_client::span!("Niri::reposition_outputs");
 
@@ -2788,9 +2902,19 @@ impl Niri {
 
         let config = self.config.borrow();
         let mut outputs = vec![];
-        for output in self.global_space.outputs().chain(new_output) {
+        // Zones are placed relative to their parent, so the parent is what gets positioned here,
+        // and zone outputs are skipped.
+        let placed = self
+            .global_space
+            .outputs()
+            .chain(self.zoned_outputs.keys())
+            .chain(new_output)
+            .filter(|output| !zone::is_zone_output(output))
+            .cloned()
+            .collect::<Vec<_>>();
+        for output in placed {
             let name = output.user_data().get::<OutputName>().unwrap();
-            let position = self.global_space.output_geometry(output).map(|geo| geo.loc);
+            let position = self.output_position(&output);
             let config = config.outputs.find(name).and_then(|c| c.position);
 
             outputs.push(Data {
@@ -2804,6 +2928,9 @@ impl Niri {
 
         for Data { output, .. } in &outputs {
             self.global_space.unmap_output(output);
+            for zone_output in self.zoned_outputs.get(output).into_iter().flatten() {
+                self.global_space.unmap_output(zone_output);
+            }
         }
 
         // Connectors can appear in udev in any order. If we sort by name then we get output
@@ -2882,7 +3009,22 @@ impl Niri {
                     Point::from((x, 0))
                 });
 
-            self.global_space.map_output(&output, new_position);
+            // A zoned output is not itself part of the global space; its zones are, laid out
+            // inside the area it was just given.
+            if let Some(zone_outputs) = self.zoned_outputs.get(&output).cloned() {
+                if let Some(state) = self.output_state.get_mut(&output) {
+                    state.zoned_position = Some(new_position);
+                }
+
+                for zone_output in zone_outputs {
+                    let geo = zone::zone_geometry(&zone_output).unwrap();
+                    let zone_position = new_position + geo.loc;
+                    self.global_space.map_output(&zone_output, zone_position);
+                    zone_output.change_current_state(None, None, None, Some(zone_position));
+                }
+            } else {
+                self.global_space.map_output(&output, new_position);
+            }
 
             // By passing new_output as an Option, rather than mapping it into a bogus location
             // in global_space, we ensure that this branch always runs for it.
@@ -2899,12 +3041,23 @@ impl Niri {
     }
 
     pub fn add_output(&mut self, output: Output, refresh_interval: Option<Duration>, vrr: bool) {
-        let global = output.create_global::<State>(&self.display_handle);
-
         let name = output.user_data().get::<OutputName>().unwrap();
 
         let config = self.config.borrow();
         let c = config.outputs.find(name);
+
+        // A zoned output is a render target only: its zones are what clients bind to and what
+        // input is routed to, so it gets no global of its own.
+        let zones = c.and_then(|c| c.zones.clone()).filter(|zones| {
+            // Zones of zones are not a thing.
+            !zone::is_zone_output(&output) && !zones.zones.is_empty()
+        });
+        let global = if zones.is_none() {
+            Some(output.create_global::<State>(&self.display_handle))
+        } else {
+            None
+        };
+
         let scale = c.and_then(|c| c.scale).map(|s| s.0).unwrap_or_else(|| {
             let size_mm = output.physical_properties().size;
             let resolution = output.current_mode().unwrap().size;
@@ -2944,7 +3097,10 @@ impl Niri {
             None,
         );
 
-        self.layout.add_output(output.clone(), layout_config);
+        // A zoned output has no workspaces of its own; its zones get monitors instead, below.
+        if zones.is_none() {
+            self.layout.add_output(output.clone(), layout_config);
+        }
 
         let lock_render_state = if self.is_locked() {
             // We haven't rendered anything yet so it's as good as locked.
@@ -2956,6 +3112,7 @@ impl Niri {
         let size = output_size(&output);
         let state = OutputState {
             global,
+            zoned_position: None,
             redraw_state: RedrawState::Idle,
             on_demand_vrr_enabled: false,
             unfinished_animations_remain: false,
@@ -2973,6 +3130,21 @@ impl Niri {
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
+
+        if let Some(zones) = zones {
+            let zone_outputs = zone::build_zone_outputs(&output, &zones);
+            self.zoned_outputs
+                .insert(output.clone(), zone_outputs.clone());
+
+            // Each zone is an ordinary output from here on: it gets a global, a monitor with its
+            // own workspaces, and a slot in the global space.
+            for zone_output in zone_outputs {
+                self.add_output(zone_output, refresh_interval, vrr);
+            }
+
+            // The zones' own reposition_outputs() calls have already placed everything.
+            return;
+        }
 
         // Must be last since it will call queue_redraw(output) which needs things to be filled-in.
         self.reposition_outputs(Some(&output));
@@ -2993,11 +3165,19 @@ impl Niri {
     }
 
     pub fn remove_output(&mut self, output: &Output) {
+        // Zones don't outlive the output they are composited into.
+        for zone_output in self.zoned_outputs.remove(output).into_iter().flatten() {
+            self.remove_output(&zone_output);
+        }
+
         for layer in layer_map_for_output(output).layers() {
             layer.layer_surface().send_close();
         }
 
-        self.layout.remove_output(output);
+        // A zoned output never had a monitor to remove.
+        if self.layout.monitor_for_output(output).is_some() {
+            self.layout.remove_output(output);
+        }
         self.global_space.unmap_output(output);
         self.reposition_outputs(None);
         self.gamma_control_manager_state.output_removed(output);
@@ -3017,20 +3197,21 @@ impl Niri {
 
         // Disable the output global and remove some time later to give the clients some time to
         // process it.
-        let global = state.global;
-        self.display_handle.disable_global::<State>(global.clone());
-        self.event_loop
-            .insert_source(
-                Timer::from_duration(Duration::from_secs(10)),
-                move |_, _, state| {
-                    state
-                        .niri
-                        .display_handle
-                        .remove_global::<State>(global.clone());
-                    TimeoutAction::Drop
-                },
-            )
-            .unwrap();
+        if let Some(global) = state.global {
+            self.display_handle.disable_global::<State>(global.clone());
+            self.event_loop
+                .insert_source(
+                    Timer::from_duration(Duration::from_secs(10)),
+                    move |_, _, state| {
+                        state
+                            .niri
+                            .display_handle
+                            .remove_global::<State>(global.clone());
+                        TimeoutAction::Drop
+                    },
+                )
+                .unwrap();
+        }
 
         match mem::take(&mut self.lock_state) {
             LockState::Locking(confirmation) => {
@@ -3067,6 +3248,20 @@ impl Niri {
     }
 
     pub fn output_resized(&mut self, output: &Output) {
+        // Zones are sized as fractions of their parent, so they all follow it.
+        if let Some(zone_outputs) = self.zoned_outputs.get(output).cloned() {
+            for zone_output in &zone_outputs {
+                zone::update_zone_output_size(zone_output);
+            }
+
+            // Resizing the parent moves the zones after it too.
+            self.reposition_outputs(None);
+
+            for zone_output in &zone_outputs {
+                self.output_resized(zone_output);
+            }
+        }
+
         let output_size = output_size(output);
         let scale = output.current_scale();
         let transform = output.current_transform();
@@ -3753,13 +3948,21 @@ impl Niri {
 
     /// Schedules an immediate redraw on all outputs if one is not already scheduled.
     pub fn queue_redraw_all(&mut self) {
-        for state in self.output_state.values_mut() {
+        for (output, state) in &mut self.output_state {
+            // Zones are redrawn as part of their parent, and never on their own.
+            if zone::is_zone_output(output) {
+                continue;
+            }
+
             state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
         }
     }
 
     /// Schedules an immediate redraw if one is not already scheduled.
     pub fn queue_redraw(&mut self, output: &Output) {
+        // A zone has no scanout pipeline of its own, so redrawing it means redrawing the physical
+        // output it is composited into.
+        let output = zone::render_target_of(output);
         let state = self.output_state.get_mut(output).unwrap();
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
     }
@@ -3787,7 +3990,9 @@ impl Niri {
     ) {
         let _span = tracy_client::span!("Niri::render_pointer");
         let output_scale = output.current_scale();
-        let output_pos = self.global_space.output_geometry(output).unwrap().loc;
+        // The pointer is drawn against whatever is being rendered, which for a zoned output is the
+        // physical output rather than any one zone.
+        let output_pos = self.output_position(output).unwrap();
 
         // Check whether we need to draw the tablet cursor or the regular cursor.
         let pointer_pos = self
@@ -4164,6 +4369,21 @@ impl Niri {
     }
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
+        // Rendering a zoned output renders its zones, so their elements need updating too.
+        if let Some(output) = output {
+            if let Some(zone_outputs) = self.zoned_outputs.get(output).cloned() {
+                self.update_render_elements_for(Some(output));
+                for zone_output in zone_outputs {
+                    self.update_render_elements_for(Some(&zone_output));
+                }
+                return;
+            }
+        }
+
+        self.update_render_elements_for(output);
+    }
+
+    fn update_render_elements_for(&mut self, output: Option<&Output>) {
         self.update_xray_render_elements(output);
         self.layout.update_render_elements(output);
 
@@ -4194,6 +4414,11 @@ impl Niri {
     // Updates only those render elements that go in the xray buffer.
     pub fn update_xray_render_elements(&mut self, output: Option<&Output>) {
         for (out, state) in self.output_state.iter_mut() {
+            // A zoned output has no workspaces of its own to put in the xray buffer.
+            if self.zoned_outputs.contains_key(out) {
+                continue;
+            }
+
             if output.is_none_or(|output| out == output) {
                 let scale = Scale::from(out.current_scale().fractional_scale());
                 let mode = out.current_mode().unwrap();
@@ -4381,6 +4606,15 @@ impl Niri {
         // Then, the Alt-Tab switcher.
         self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
+
+        // A zoned output has no monitor or layer-shell surfaces of its own; everything below this
+        // point lives on its zones instead.
+        //
+        // FIXME: composite the zones' contents in here.
+        if self.zoned_outputs.contains_key(output) {
+            push(backdrop);
+            return;
+        }
 
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
@@ -4690,8 +4924,16 @@ impl Niri {
 
         let mut res = RenderResult::Skipped;
         if self.monitors_active {
+            // A zoned output has no layout of its own; what animates on it is its zones.
+            let layout_animating = match self.zoned_outputs.get(output) {
+                Some(zone_outputs) => zone_outputs
+                    .iter()
+                    .any(|zone_output| self.layout.are_animations_ongoing(Some(zone_output))),
+                None => self.layout.are_animations_ongoing(Some(output)),
+            };
+
             let state = self.output_state.get_mut(output).unwrap();
-            state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
+            state.unfinished_animations_remain = layout_animating;
             state.unfinished_animations_remain |=
                 self.config_error_notification.are_animations_ongoing();
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
@@ -4704,12 +4946,19 @@ impl Niri {
                 .cursor_manager
                 .is_current_cursor_animated(output.current_scale().integer_scale());
 
-            // Also check layer surfaces.
+            // Also check layer surfaces. On a zoned output they are bound to its zones, since the
+            // output itself has no global for clients to bind to.
             if !state.unfinished_animations_remain {
-                state.unfinished_animations_remain |= layer_map_for_output(output)
-                    .layers()
-                    .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
-                    .any(|mapped| mapped.are_animations_ongoing());
+                let mut layer_animating = false;
+                for out in zone_outputs_or_self(&self.zoned_outputs, output) {
+                    layer_animating |= layer_map_for_output(out)
+                        .layers()
+                        .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
+                        .any(|mapped| mapped.are_animations_ongoing());
+                }
+
+                let state = self.output_state.get_mut(output).unwrap();
+                state.unfinished_animations_remain |= layer_animating;
             }
 
             // Render.
@@ -4782,11 +5031,13 @@ impl Niri {
         //
         // However, this should probably be restricted to sending frame callbacks to more surfaces,
         // to err on the safe side.
-        let is_virtual = crate::backend::VirtualOutputMarker::is_virtual(output);
-        if is_virtual {
-            self.send_frame_callbacks_for_virtual_output(output);
-        } else {
-            self.send_frame_callbacks(output);
+        // On a zoned output the surfaces belong to its zones, so they are the ones to notify.
+        for out in zone_outputs_or_self(&self.zoned_outputs, output).to_vec() {
+            if crate::backend::VirtualOutputMarker::is_virtual(&out) {
+                self.send_frame_callbacks_for_virtual_output(&out);
+            } else {
+                self.send_frame_callbacks(&out);
+            }
         }
 
         backend.with_primary_renderer(|renderer| {
@@ -6631,6 +6882,20 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// Returns the outputs that client surfaces live on for a given render target.
+///
+/// For a zoned output that's its zones, since clients can only bind to those. For anything else
+/// it's the output itself.
+fn zone_outputs_or_self<'a>(
+    zoned_outputs: &'a HashMap<Output, Vec<Output>>,
+    output: &'a Output,
+) -> &'a [Output] {
+    match zoned_outputs.get(output) {
+        Some(zone_outputs) => zone_outputs.as_slice(),
+        None => slice::from_ref(output),
+    }
 }
 
 fn scale_relocate_crop<E: Element>(
