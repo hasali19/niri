@@ -314,7 +314,7 @@ impl State {
         I::Device: 'static,
     {
         let device_output = event.device().output(self);
-        let device_output = device_output.filter(|output| self.niri.output_exists(output));
+        let device_output = device_output.filter(|output| self.niri.output_is_input_target(output));
         let device_output = device_output.as_ref();
         let mapped_output = device_output.or_else(|| self.niri.output_for_tablet());
 
@@ -4226,7 +4226,7 @@ impl State {
         fallback_output: Option<&Output>,
     ) -> Option<Point<f64, Logical>> {
         let output = evt.device().output(self);
-        let output = output.filter(|output| self.niri.output_exists(output));
+        let output = output.filter(|output| self.niri.output_is_input_target(output));
         let output = output.as_ref().or(fallback_output)?;
         let output_geo = self.niri.global_space.output_geometry(output).unwrap();
         let transform = output.current_transform();

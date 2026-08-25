@@ -2407,7 +2407,7 @@ impl Tty {
             }
 
             if self.virtual_outputs.outputs.contains_key(name)
-                || niri.global_space.outputs().any(|o| o.name() == name)
+                || niri.output_state.keys().any(|o| o.name() == name)
             {
                 return Err(format!("output '{name}' already exists"));
             }
@@ -2422,7 +2422,7 @@ impl Tty {
         );
 
         if self.virtual_outputs.outputs.contains_key(&built.name)
-            || niri.global_space.outputs().any(|o| o.name() == built.name)
+            || niri.output_state.keys().any(|o| o.name() == built.name)
         {
             return Err(format!("output '{}' already exists", built.name));
         }

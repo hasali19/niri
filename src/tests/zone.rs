@@ -1,6 +1,7 @@
 use niri_config::output::{Zone, Zones};
 use niri_config::utils::Percent;
 use niri_config::Config;
+use smithay::backend::renderer::Color32F;
 use smithay::output::Output;
 
 use super::*;
@@ -134,6 +135,55 @@ fn zones_follow_their_output_across_a_resize() {
     assert_eq!(left_geo.size.h, 2160);
     assert_eq!(right_geo.loc.x, left_geo.loc.x + left_geo.size.w);
     assert_eq!(right_geo.size, left_geo.size);
+}
+
+#[test]
+fn zones_inherit_their_output_scale() {
+    let mut config = halves_config();
+    config.outputs.0[0].scale = Some(niri_config::FloatOrInt(2.));
+
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    let left = output_named(&mut f, "headless-1:left");
+
+    // A zone reports no physical size, so if it went through the usual scale guessing it would
+    // come out as 1 and the zone would be drawn at the wrong size.
+    assert_eq!(left.current_scale().fractional_scale(), 2.);
+
+    // Half of the output's 960 logical points, at scale 2.
+    let geo = f.niri().global_space.output_geometry(&left).unwrap();
+    assert_eq!(geo.size.w, 480);
+    assert_eq!(left.current_mode().unwrap().size.w, 960);
+}
+
+#[test]
+fn zones_inherit_their_output_config() {
+    let mut config = halves_config();
+    let backdrop = niri_config::Color::new_unpremul(1., 0., 0., 1.);
+    config.outputs.0[0].backdrop_color = Some(backdrop);
+
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    // Settings written for a display apply to the zones it is split into, rather than silently
+    // doing nothing because the zones have config sections of their own.
+    let left = output_named(&mut f, "headless-1:left");
+    let right = output_named(&mut f, "headless-1:right");
+    let expected = Color32F::from({
+        let mut c = backdrop.to_array_unpremul();
+        c[3] = 1.;
+        c
+    });
+
+    assert_eq!(
+        f.niri().output_state[&left].backdrop_buffer.color(),
+        expected
+    );
+    assert_eq!(
+        f.niri().output_state[&right].backdrop_buffer.color(),
+        expected
+    );
 }
 
 #[test]

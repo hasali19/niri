@@ -803,7 +803,7 @@ impl State {
             //
             // We check both the compositor output list (connected outputs) and the IPC output
             // state, because virtual outputs can exist while being currently disconnected (`off`).
-            let exists = self.niri.global_space.outputs().any(|o| o.name() == name)
+            let exists = self.niri.output_state.keys().any(|o| o.name() == name)
                 || self
                     .backend
                     .ipc_outputs()
@@ -1896,6 +1896,16 @@ impl State {
             let full_config = self.niri.config.borrow_mut();
             let config = full_config.outputs.find(name);
 
+            // A zone falls back to the config of the output it is part of.
+            let parent_config = zone::parent_of_zone(output)
+                .and_then(|parent| parent.user_data().get::<OutputName>())
+                .and_then(|name| full_config.outputs.find(name));
+            let inherited = |get: fn(&niri_config::output::Output) -> bool| {
+                config
+                    .filter(|c| get(c))
+                    .or(parent_config.filter(|c| get(c)))
+            };
+
             // A zone's scale and transform come from the output it is part of, not from config.
             if !zone::is_zone_output(output) {
                 let scale = config
@@ -1931,7 +1941,7 @@ impl State {
                 }
             }
 
-            let mut backdrop_color = config
+            let mut backdrop_color = inherited(|c| c.backdrop_color.is_some())
                 .and_then(|c| c.backdrop_color)
                 .unwrap_or(full_config.overview.backdrop_color)
                 .to_array_unpremul();
@@ -1950,11 +1960,13 @@ impl State {
                     continue;
                 }
 
-                let mut layout_config = config.and_then(|c| c.layout.clone());
+                let mut layout_config =
+                    inherited(|c| c.layout.is_some()).and_then(|c| c.layout.clone());
                 // Support the deprecated non-layout background-color key.
                 if let Some(layout) = &mut layout_config {
                     if layout.background_color.is_none() {
-                        layout.background_color = config.and_then(|c| c.background_color);
+                        layout.background_color = inherited(|c| c.background_color.is_some())
+                            .and_then(|c| c.background_color);
                     }
                 }
 
@@ -3047,6 +3059,15 @@ impl Niri {
         let config = self.config.borrow();
         let c = config.outputs.find(name);
 
+        // A zone falls back to the config of the output it is part of, so that settings written
+        // for a display still apply to it without having to be repeated per zone.
+        let parent_c = zone::parent_of_zone(&output)
+            .and_then(|parent| parent.user_data().get::<OutputName>())
+            .and_then(|name| config.outputs.find(name));
+        let inherited = |get: fn(&niri_config::output::Output) -> bool| {
+            c.filter(|c| get(c)).or(parent_c.filter(|c| get(c)))
+        };
+
         // A zoned output is a render target only: its zones are what clients bind to and what
         // input is routed to, so it gets no global of its own.
         let zones = c.and_then(|c| c.zones.clone()).filter(|zones| {
@@ -3070,7 +3091,7 @@ impl Niri {
             + c.map(|c| ipc_transform_to_smithay(c.transform))
                 .unwrap_or(Transform::Normal);
 
-        let mut backdrop_color = c
+        let mut backdrop_color = inherited(|c| c.backdrop_color.is_some())
             .and_then(|c| c.backdrop_color)
             .unwrap_or(config.overview.backdrop_color)
             .to_array_unpremul();
@@ -3081,22 +3102,29 @@ impl Niri {
             transform = Transform::Flipped180;
         }
 
-        let mut layout_config = c.and_then(|c| c.layout.clone());
+        let layout_c = inherited(|c| c.layout.is_some());
+        let mut layout_config = layout_c.and_then(|c| c.layout.clone());
         // Support the deprecated non-layout background-color key.
         if let Some(layout) = &mut layout_config {
             if layout.background_color.is_none() {
-                layout.background_color = c.and_then(|c| c.background_color);
+                layout.background_color =
+                    inherited(|c| c.background_color.is_some()).and_then(|c| c.background_color);
             }
         }
         drop(config);
 
-        // Set scale and transform before adding to the layout since that will read the output size.
-        output.change_current_state(
-            None,
-            Some(transform),
-            Some(output::Scale::Fractional(scale)),
-            None,
-        );
+        // A zone's scale and transform come from the output it is part of, not from config, so
+        // they are already set and must not be recomputed here: a zone reports no physical size,
+        // which would make the guess come out as 1.
+        if !zone::is_zone_output(&output) {
+            // Set scale and transform before adding to the layout since that reads the output size.
+            output.change_current_state(
+                None,
+                Some(transform),
+                Some(output::Scale::Fractional(scale)),
+                None,
+            );
+        }
 
         // A zoned output has no workspaces of its own; its zones get monitors instead, below.
         if zones.is_none() {
@@ -3153,6 +3181,13 @@ impl Niri {
 
     pub fn output_exists(&self, output: &Output) -> bool {
         self.output_state.contains_key(output)
+    }
+
+    /// Returns whether an output can be a target for input.
+    ///
+    /// A zoned output cannot: input goes to its zones, which are what the global space holds.
+    pub fn output_is_input_target(&self, output: &Output) -> bool {
+        self.global_space.output_geometry(output).is_some()
     }
 
     /// Converts a `WlOutput` to a corresponding `Output` if it exists.
