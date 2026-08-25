@@ -1613,16 +1613,7 @@ impl Tty {
 
         debug!("disconnecting connector: {:?}", surface.name.connector);
 
-        let output = niri
-            .global_space
-            .outputs()
-            .find(|output| {
-                let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
-                    return false;
-                };
-                tty_state.node == node && tty_state.crtc == crtc
-            })
-            .cloned();
+        let output = output_for_crtc(niri, node, crtc).cloned();
         if let Some(output) = output {
             niri.remove_output(&output);
         } else {
@@ -1695,18 +1686,10 @@ impl Tty {
             .unwrap()
             .message(&message, 0);
 
-        let Some(output) = niri
-            .global_space
-            .outputs()
-            .find(|output| {
-                let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
-                    return false;
-                };
-                tty_state.node == node && tty_state.crtc == crtc
-            })
-            .cloned()
-        else {
-            error!("missing output in global space for {name}");
+        // Failing to find the output here would leave it stuck in `WaitingForVBlank`, never
+        // drawing again.
+        let Some(output) = output_for_crtc(niri, node, crtc).cloned() else {
+            error!("missing output for {name}");
             return;
         };
 
@@ -2688,16 +2671,7 @@ impl Tty {
                     continue;
                 }
 
-                let output = niri
-                    .global_space
-                    .outputs()
-                    .find(|output| {
-                        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
-                            return false;
-                        };
-                        tty_state.node == node && tty_state.crtc == crtc
-                    })
-                    .cloned();
+                let output = output_for_crtc(niri, node, crtc).cloned();
                 let Some(output) = output else {
                     error!("missing output for crtc: {crtc:?}");
                     continue;
@@ -3402,6 +3376,20 @@ pub fn calculate_mode_cvt(width: u16, height: u16, refresh: f64) -> DrmMode {
 
 // Returns a c-string of maximally 31 Rust string chars + null terminator. Excess characters are
 // dropped.
+/// Finds the output driven by a CRTC.
+///
+/// Deliberately searches every output niri tracks rather than the global space: an output that is
+/// split into zones is not mapped into the global space, only its zones are, but it is still the
+/// one being scanned out on this CRTC.
+fn output_for_crtc(niri: &Niri, node: DrmNode, crtc: crtc::Handle) -> Option<&Output> {
+    niri.output_state.keys().find(|output| {
+        let Some(tty_state) = output.user_data().get::<TtyOutputState>() else {
+            return false;
+        };
+        tty_state.node == node && tty_state.crtc == crtc
+    })
+}
+
 fn modeinfo_name_slice_from_string(mode_name: &str) -> [core::ffi::c_char; 32] {
     let mut name: [core::ffi::c_char; 32] = [0; 32];
 
