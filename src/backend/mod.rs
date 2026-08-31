@@ -62,7 +62,7 @@ static OUTPUT_ID_COUNTER: IdCounter = IdCounter::new();
 pub struct OutputId(u64);
 
 impl OutputId {
-    fn next() -> OutputId {
+    pub(crate) fn next() -> OutputId {
         OutputId(OUTPUT_ID_COUNTER.next())
     }
 

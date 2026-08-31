@@ -656,6 +656,90 @@ mod tests {
     }
 
     #[test]
+    fn parse_output_zones() {
+        let parsed = do_parse(
+            r#"
+            output "DP-1" {
+                zones {
+                    zone "left" x="0%" y="0%" width="50%" height="100%"
+                    zone "top-right" x="50%" y="0%" width="50%" height="40%"
+                    zone "bottom-right" x="50%" y="40%" width="50%" height="60%"
+                }
+            }
+            "#,
+        );
+
+        let zones = parsed.outputs.0[0].zones.as_ref().unwrap();
+        assert_eq!(
+            zones
+                .zones
+                .iter()
+                .map(|zone| (
+                    zone.name.as_str(),
+                    zone.x.0,
+                    zone.y.0,
+                    zone.width.0,
+                    zone.height.0
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("left", 0., 0., 0.5, 1.),
+                ("top-right", 0.5, 0., 0.5, 0.4),
+                ("bottom-right", 0.5, 0.4, 0.5, 0.6),
+            ]
+        );
+    }
+
+    #[test]
+    fn output_without_zones_has_none() {
+        let parsed = do_parse(r#"output "DP-1" { scale 2; }"#);
+        assert!(parsed.outputs.0[0].zones.is_none());
+    }
+
+    #[test]
+    fn invalid_output_zones_are_rejected() {
+        // Extends past the right edge.
+        assert!(Config::parse_mem(
+            r#"output "DP-1" { zones { zone "a" x="50%" y="0%" width="60%" height="100%" } }"#
+        )
+        .is_err());
+
+        // Zero-sized.
+        assert!(Config::parse_mem(
+            r#"output "DP-1" { zones { zone "a" x="0%" y="0%" width="0%" height="100%" } }"#
+        )
+        .is_err());
+
+        // Negative position.
+        assert!(Config::parse_mem(
+            r#"output "DP-1" { zones { zone "a" x="-10%" y="0%" width="50%" height="100%" } }"#
+        )
+        .is_err());
+
+        // Duplicate zone names.
+        assert!(Config::parse_mem(
+            r#"
+            output "DP-1" {
+                zones {
+                    zone "a" x="0%" y="0%" width="50%" height="100%"
+                    zone "a" x="50%" y="0%" width="50%" height="100%"
+                }
+            }
+            "#
+        )
+        .is_err());
+
+        // A ':' would be ambiguous with the "<output>:<zone>" naming.
+        assert!(Config::parse_mem(
+            r#"output "DP-1" { zones { zone "a:b" x="0%" y="0%" width="50%" height="100%" } }"#
+        )
+        .is_err());
+
+        // No zones at all.
+        assert!(Config::parse_mem(r#"output "DP-1" { zones { } }"#).is_err());
+    }
+
+    #[test]
     fn parse_on_xdg_activate() {
         let parsed = do_parse(
             r#"
@@ -1230,6 +1314,7 @@ mod tests {
                             },
                         ),
                         layout: None,
+                        zones: None,
                     },
                     Output {
                         off: false,
@@ -1258,6 +1343,7 @@ mod tests {
                         backdrop_color: None,
                         hot_corners: None,
                         layout: None,
+                        zones: None,
                     },
                     Output {
                         off: false,
@@ -1289,6 +1375,7 @@ mod tests {
                         backdrop_color: None,
                         hot_corners: None,
                         layout: None,
+                        zones: None,
                     },
                 ],
             ),

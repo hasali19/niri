@@ -606,6 +606,8 @@ fn print_output(output: Output) -> anyhow::Result<()> {
         vrr_enabled,
         logical,
         max_bpc,
+        zones,
+        zone_of,
     } = output;
 
     let serial = serial.as_deref().unwrap_or("Unknown");
@@ -691,6 +693,14 @@ fn print_output(output: Output) -> anyhow::Result<()> {
 
     if let Some(max_bpc) = max_bpc {
         println!("  Max bits per channel: {max_bpc}");
+    }
+
+    if !zones.is_empty() {
+        println!("  Split into zones: {}", zones.join(", "));
+    }
+
+    if let Some(zone_of) = zone_of {
+        println!("  Zone of: {zone_of}");
     }
 
     println!("  Available modes:");

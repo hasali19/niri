@@ -12,3 +12,4 @@ mod remove_output;
 mod transactions;
 mod virtual_output;
 mod window_opening;
+mod zone;

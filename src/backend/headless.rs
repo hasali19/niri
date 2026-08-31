@@ -284,6 +284,8 @@ impl Headless {
                 vrr_enabled: false,
                 logical: Some(logical_output(&output)),
                 max_bpc: None,
+                zones: Vec::new(),
+                zone_of: None,
             },
         );
 
@@ -331,8 +333,7 @@ impl Headless {
             if name.trim().is_empty() {
                 return Err("virtual output name cannot be empty".to_string());
             }
-            if self.outputs.contains_key(name)
-                || niri.global_space.outputs().any(|o| o.name() == name)
+            if self.outputs.contains_key(name) || niri.output_state.keys().any(|o| o.name() == name)
             {
                 return Err(format!("output '{name}' already exists"));
             }
@@ -347,7 +348,7 @@ impl Headless {
         );
 
         if self.outputs.contains_key(&built.name)
-            || niri.global_space.outputs().any(|o| o.name() == built.name)
+            || niri.output_state.keys().any(|o| o.name() == built.name)
         {
             return Err(format!("output '{}' already exists", built.name));
         }

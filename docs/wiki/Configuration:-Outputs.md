@@ -30,6 +30,11 @@ output "eDP-1" {
         // ...layout settings for eDP-1...
     }
 
+    // zones {
+    //     zone "left" x="0%" y="0%" width="50%" height="100%"
+    //     zone "right" x="50%" y="0%" width="50%" height="100%"
+    // }
+
     // Custom modes. Caution: may damage your display.
     // mode custom=true "1920x1080@100"
     // modeline 173.00  1920 2048 2248 2576  1080 1083 1088 1120 "-hsync" "+vsync"
@@ -402,3 +407,71 @@ output "eDP-1" {
     }
 }
 ```
+
+### `zones`
+
+Splits one monitor into several independent workspace areas.
+
+Each zone behaves like a monitor of its own: it has its own set of workspaces, its own active workspace, and its own focus.
+Switching workspaces in one zone leaves the others alone.
+
+```kdl
+output "DP-1" {
+    zones {
+        zone "left" x="0%" y="0%" width="50%" height="100%"
+        zone "right" x="50%" y="0%" width="50%" height="100%"
+    }
+}
+```
+
+A `zone` takes a name, then `x`, `y`, `width` and `height` as percentages of the monitor's logical size.
+`x` and `y` are the position of the zone's top left corner.
+
+Zones don't have to be a simple split; any set of rectangles works:
+
+```kdl
+output "DP-1" {
+    zones {
+        zone "main" x="0%" y="0%" width="60%" height="100%"
+        zone "top" x="60%" y="0%" width="40%" height="60%"
+        zone "bottom" x="60%" y="60%" width="40%" height="40%"
+    }
+}
+```
+
+Because zones are sized in percentages, they follow the monitor across mode, scale and rotation changes.
+
+Zones must fit inside the monitor and must not be empty, or the config is rejected.
+They may overlap or leave gaps, though; niri doesn't require them to tile the screen.
+Whatever they don't cover shows the backdrop.
+
+#### Referring to a zone
+
+A zone is an output in its own right, named `"<connector>:<zone>"`.
+That name is what to use anywhere niri takes an output name — `open-on-output`, `niri msg`, and layer-shell clients like bars and wallpaper daemons:
+
+```kdl
+workspace "chat" {
+    open-on-output "DP-1:left"
+}
+```
+
+```kdl
+output "DP-1:left" {
+    // ...settings for just this zone...
+}
+```
+
+A zone inherits `layout`, `background-color` and `backdrop-color` from the monitor it's part of, so settings written for `DP-1` also apply to `DP-1:left` unless that zone overrides them.
+`scale`, `transform`, `mode` and `position` come from the monitor and can't be set per zone.
+
+#### Effects on the monitor itself
+
+Once a monitor has zones, it stops being a workspace area, and only its zones are:
+
+- It holds no workspaces of its own.
+- Clients can't open windows on it, and bars and other layer-shell surfaces have to pick a zone.
+- Input never lands on it; the pointer belongs to whichever zone it's over.
+- `niri msg outputs` still lists it, showing which zones it was split into, but with no logical position of its own.
+
+The monitor is still what's configured and what gets drawn, so its `mode`, `scale`, `position` and so on work as usual, and it keeps appearing in display-configuration tools.
