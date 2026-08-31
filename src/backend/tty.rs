@@ -2327,6 +2327,7 @@ impl Tty {
                 vrr_supported: false,
                 vrr_enabled: false,
                 logical,
+                max_bpc: None,
             };
 
             ipc_outputs.insert(*output_id, ipc_output);
