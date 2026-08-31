@@ -578,7 +578,7 @@ impl input::LibinputInterface for HeadlessLibinputInterface {
 }
 
 fn init_headless_libinput(event_loop: LoopHandle<'static, State>, seat: &str) {
-    let mut libinput = Libinput::new_with_udev(HeadlessLibinputInterface::default());
+    let mut libinput = Libinput::new_with_udev(HeadlessLibinputInterface);
 
     unsafe { super::libinput_plugins::init_libinput_plugin_system(&libinput) };
 
@@ -596,6 +596,5 @@ fn init_headless_libinput(event_loop: LoopHandle<'static, State>, seat: &str) {
         .is_err()
     {
         debug!("headless: failed to insert libinput backend; input will be unavailable");
-        return;
     }
 }
