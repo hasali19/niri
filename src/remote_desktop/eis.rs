@@ -523,7 +523,10 @@ fn region_list(state: &State) -> Vec<Rectangle<i32, Logical>> {
 }
 
 /// Maps a global logical point into the coordinate space niri uses for absolute pointer events.
-fn global_position(state: &State, global: Point<f64, Logical>) -> Option<AbsolutePosition> {
+pub(crate) fn global_position(
+    state: &State,
+    global: Point<f64, Logical>,
+) -> Option<AbsolutePosition> {
     // `on_pointer_motion_absolute` falls back to the bounding rectangle of all outputs when the
     // device has no output, and that fallback is an exact identity for us: it computes
     // `position_transformed(bounds.size) + bounds.loc`.
@@ -538,7 +541,7 @@ fn global_position(state: &State, global: Point<f64, Logical>) -> Option<Absolut
 ///
 /// Touch needs a specific output, since `compute_touch_location` falls back to
 /// `output_for_touch()` rather than the global bounding rectangle.
-fn output_position(
+pub(crate) fn output_position(
     state: &State,
     device: &EiDevice,
     global: Point<f64, Logical>,

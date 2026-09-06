@@ -9,6 +9,9 @@ They’re useful for:
 - VNC (e.g. wayvnc)
 - “headless” remote sessions and general screen sharing
 
+For a remote desktop service that manages its own monitors over D-Bus, see
+[Remote Desktop](./Remote-Desktop.md); the monitors it creates are these same virtual outputs.
+
 ## Creating virtual outputs
 
 ### TTY backend (regular session with physical displays)

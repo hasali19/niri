@@ -46,6 +46,12 @@ clipboard {
     disable-primary
 }
 
+remote-desktop {
+    enable-input
+    enable-clipboard
+    virtual-monitor-default-mode "1920x1080@60"
+}
+
 hotkey-overlay {
     skip-at-startup
     hide-not-bound
@@ -282,6 +288,30 @@ Toggling this flag will only apply to applications started afterward.
 ```kdl
 clipboard {
     disable-primary
+}
+```
+
+### `remote-desktop`
+
+Settings for the `org.freedesktop.RemoteDesktop1` D-Bus API, which lets a remote desktop service
+drive the session unattended.
+See [Remote Desktop](./Remote-Desktop.md) for what a service can do with it.
+
+The API is off unless this section is present, because it lets any peer on the session bus capture
+the screen and inject input without asking anyone first.
+
+Set `enable-input` to allow services to connect to the EIS input server, and `enable-clipboard` to
+allow them to integrate with the clipboard.
+Without them, `ConnectToEIS()` and `EnableClipboard()` return a not-supported error.
+
+`virtual-monitor-default-mode` is the mode new virtual monitors start with.
+A service can change it afterwards by negotiating a different size on the PipeWire stream.
+
+```kdl
+remote-desktop {
+    enable-input
+    enable-clipboard
+    virtual-monitor-default-mode "1920x1080@60"
 }
 ```
 

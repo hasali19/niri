@@ -103,7 +103,8 @@ impl Session {
         Ok(())
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    // zbus would derive `ConnectToEis` from the method name.
+    #[zbus(name = "ConnectToEIS")]
     async fn connect_to_eis(
         &self,
         #[zbus(header)] hdr: zbus::message::Header<'_>,

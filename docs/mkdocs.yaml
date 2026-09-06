@@ -78,6 +78,8 @@ nav:
     - Tabs: Tabs.md
     - Overview: Overview.md
     - Screencasting: Screencasting.md
+    - Virtual Outputs: Virtual-Outputs.md
+    - Remote Desktop: Remote-Desktop.md
     - Layer‐Shell Components: Layer‐Shell-Components.md
     - IPC, niri msg: IPC.md
     - Application-Specific Issues: Application-Issues.md
