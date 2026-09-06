@@ -4,3 +4,6 @@ Comment=A scrollable-tiling Wayland compositor
 Exec=niri-session
 Type=Application
 DesktopNames=niri
+# Advertises support for the org.freedesktop.RemoteDesktop1 D-Bus API. It still has to be
+# enabled with a remote-desktop section in the niri config.
+X-RemoteDesktop1-Supported=true

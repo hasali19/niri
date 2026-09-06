@@ -2160,6 +2160,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "rayon",
+ "reis",
  "sd-notify",
  "serde",
  "serde_json",

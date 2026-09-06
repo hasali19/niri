@@ -290,7 +290,7 @@ impl State {
     }
 
     /// Computes the rectangle that covers all outputs in global space.
-    fn global_bounding_rectangle(&self) -> Option<Rectangle<i32, Logical>> {
+    pub fn global_bounding_rectangle(&self) -> Option<Rectangle<i32, Logical>> {
         self.niri.global_space.outputs().fold(
             None,
             |acc: Option<Rectangle<i32, Logical>>, output| {

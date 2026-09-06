@@ -418,6 +418,9 @@ pub struct Niri {
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
+
+    #[cfg(feature = "remote-desktop")]
+    pub remote_desktop: crate::remote_desktop::RemoteDesktopState,
 }
 
 smithay::delegate_dispatch2!(State);
@@ -578,6 +581,20 @@ pub enum CenterCoords {
     Both,
     // Force centering even if the cursor is already in the rectangle.
     BothAlways,
+}
+
+/// Data behind a selection niri owns.
+///
+/// niri sets the selection itself in two cases: a screenshot copied to the clipboard, which is a
+/// plain byte buffer, and a selection owned by a remote desktop session, whose data has to be
+/// fetched from the remote service over D-Bus when a Wayland client asks for it.
+#[derive(Debug, Clone)]
+pub enum NiriSelection {
+    Bytes(Arc<[u8]>),
+    Remote {
+        session: crate::utils::RemoteDesktopSessionId,
+        target: smithay::wayland::selection::SelectionTarget,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -892,6 +909,8 @@ impl State {
 
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
+        #[cfg(feature = "remote-desktop")]
+        self.refresh_remote_desktop_monitors();
         self.ipc_refresh_layout();
         self.ipc_refresh_keyboard_layout_index();
 
@@ -1536,9 +1555,12 @@ impl State {
 
         let rate = 1.0 / config.animations.slowdown.max(0.001);
         self.niri.clock.set_rate(rate);
-        self.niri
-            .clock
-            .set_complete_instantly(config.animations.off);
+        #[cfg(feature = "remote-desktop")]
+        let animations_off =
+            config.animations.off || self.niri.remote_desktop.animations_disabled();
+        #[cfg(not(feature = "remote-desktop"))]
+        let animations_off = config.animations.off;
+        self.niri.clock.set_complete_instantly(animations_off);
 
         *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
@@ -2720,6 +2742,9 @@ impl Niri {
 
             #[cfg(feature = "xdp-gnome-screencast")]
             casting: screencasting,
+
+            #[cfg(feature = "remote-desktop")]
+            remote_desktop: Default::default(),
         };
 
         niri.reset_pointer_inactivity_timer();
@@ -5820,7 +5845,7 @@ impl Niri {
                         &state.niri.display_handle,
                         &state.niri.seat,
                         vec![String::from("image/png")],
-                        buf.clone(),
+                        NiriSelection::Bytes(buf.clone()),
                     );
                 }
                 calloop::channel::Event::Closed => (),

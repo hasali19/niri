@@ -17,6 +17,9 @@ pub mod mutter_screen_cast;
 #[cfg(feature = "xdp-gnome-screencast")]
 use mutter_screen_cast::ScreenCast;
 
+#[cfg(feature = "remote-desktop")]
+pub mod remote_desktop;
+
 use self::freedesktop_screensaver::ScreenSaver;
 use self::gnome_shell_introspect::Introspect;
 use self::mutter_display_config::DisplayConfig;
@@ -35,6 +38,8 @@ pub struct DBusServers {
     pub conn_introspect: Option<Connection>,
     #[cfg(feature = "xdp-gnome-screencast")]
     pub conn_screen_cast: Option<Connection>,
+    #[cfg(feature = "remote-desktop")]
+    pub conn_remote_desktop: Option<Connection>,
     pub conn_login1: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_a11y_manager: Option<Connection>,
@@ -128,6 +133,41 @@ impl DBusServers {
                     .unwrap();
                 let screen_cast = ScreenCast::new(backend.ipc_outputs(), to_niri);
                 dbus.conn_screen_cast = try_start(screen_cast);
+            }
+
+            #[cfg(feature = "remote-desktop")]
+            if let Some(config) = config.remote_desktop.clone() {
+                use self::remote_desktop::RemoteDesktop;
+
+                let (to_niri, from_remote_desktop) = calloop::channel::channel();
+                let (to_remote_desktop, from_niri) = async_channel::unbounded();
+                niri.event_loop
+                    .insert_source(from_remote_desktop, move |event, _, state| match event {
+                        calloop::channel::Event::Msg(msg) => state.on_remote_desktop_msg(msg),
+                        calloop::channel::Event::Closed => (),
+                    })
+                    .unwrap();
+
+                let remote_desktop = RemoteDesktop::new(
+                    to_niri.clone(),
+                    config.enable_input,
+                    config.enable_clipboard,
+                );
+                let registry = remote_desktop.registry();
+
+                match remote_desktop.start() {
+                    Ok(conn) => {
+                        self::remote_desktop::spawn_tasks(&conn, to_niri, from_niri, registry);
+                        dbus.conn_remote_desktop = Some(conn);
+
+                        niri.remote_desktop.to_dbus = Some(to_remote_desktop);
+                        niri.remote_desktop.default_mode =
+                            Some(config.virtual_monitor_default_mode);
+                    }
+                    Err(err) => {
+                        warn!("error starting the remote desktop service: {err:?}");
+                    }
+                }
             }
 
             let (to_niri, from_a11y) = calloop::channel::channel();

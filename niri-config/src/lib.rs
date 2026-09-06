@@ -85,6 +85,10 @@ pub struct Config {
     pub overview: Overview,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
+    /// Configuration for the `org.freedesktop.RemoteDesktop1` D-Bus API.
+    ///
+    /// `None` (the default) means the API is disabled and the D-Bus service is not started.
+    pub remote_desktop: Option<RemoteDesktop>,
     pub window_rules: Vec<WindowRule>,
     pub layer_rules: Vec<LayerRule>,
     pub binds: Binds,
@@ -201,6 +205,14 @@ where
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
+                "remote-desktop" => {
+                    let part = RemoteDesktopPart::decode_node(node, ctx)?;
+                    let mut config = config.borrow_mut();
+                    config
+                        .remote_desktop
+                        .get_or_insert_with(RemoteDesktop::default)
+                        .merge_with(&part);
+                }
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
 
@@ -964,6 +976,12 @@ mod tests {
                 render-drm-device "/dev/dri/renderD129"
                 ignore-drm-device "/dev/dri/renderD128"
                 ignore-drm-device "/dev/dri/renderD130"
+            }
+
+            remote-desktop {
+                enable-input
+                enable-clipboard
+                virtual-monitor-default-mode "2560x1440@75"
             }
 
             workspace "workspace-1" {
@@ -1746,6 +1764,19 @@ mod tests {
                 off: false,
                 path: "xwayland-satellite",
             },
+            remote_desktop: Some(
+                RemoteDesktop {
+                    enable_input: true,
+                    enable_clipboard: true,
+                    virtual_monitor_default_mode: ConfiguredMode {
+                        width: 2560,
+                        height: 1440,
+                        refresh: Some(
+                            75.0,
+                        ),
+                    },
+                },
+            ),
             window_rules: [
                 WindowRule {
                     matches: [

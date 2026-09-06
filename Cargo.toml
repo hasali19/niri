@@ -84,6 +84,7 @@ pipewire = { version = "0.10.0", optional = true, features = ["v0_3_33"] }
 png = "0.18.1"
 portable-atomic = "1"
 profiling = "1.0.18"
+reis = { version = "0.7.1", optional = true, features = ["calloop"] }
 sd-notify = "0.5.0"
 serde.workspace = true
 serde_json.workspace = true
@@ -129,13 +130,15 @@ xshell = "0.2.7"
 pkg-config = "0.3.33"
 
 [features]
-default = ["dbus", "systemd", "xdp-gnome-screencast"]
+default = ["dbus", "systemd", "xdp-gnome-screencast", "remote-desktop"]
 # Enables D-Bus support (serve various freedesktop and GNOME interfaces, accessibility tree, power button handling).
 dbus = ["dep:zbus", "dep:async-io", "dep:accesskit", "dep:accesskit_unix"]
 # Enables systemd integration (global environment, apps in transient scopes).
 systemd = ["dbus"]
 # Enables screencasting support through xdg-desktop-portal-gnome.
 xdp-gnome-screencast = ["dbus", "pipewire"]
+# Enables the org.freedesktop.RemoteDesktop1 D-Bus API for unattended remote desktop services.
+remote-desktop = ["dbus", "xdp-gnome-screencast", "dep:reis"]
 # Enables the Tracy profiler instrumentation.
 profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default", "smithay/tracy_gpu_profiling"]
 # Enables the on-demand Tracy profiler instrumentation.

@@ -6,7 +6,6 @@ mod xdg_shell;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -56,7 +55,7 @@ use smithay::wayland::selection::primary_selection::{
 use smithay::wayland::selection::wlr_data_control::{
     DataControlHandler as WlrDataControlHandler, DataControlState as WlrDataControlState,
 };
-use smithay::wayland::selection::{SelectionHandler, SelectionTarget};
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::session_lock::{
     LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker,
 };
@@ -68,7 +67,7 @@ pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::input::click_grab::ClickGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, LayoutElement};
-use crate::niri::{DndIcon, NewClient, State};
+use crate::niri::{DndIcon, NewClient, NiriSelection, State};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceHandler, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{
     self, ForeignToplevelHandler, ForeignToplevelManagerState,
@@ -297,28 +296,54 @@ impl KeyboardShortcutsInhibitHandler for State {
 }
 
 impl SelectionHandler for State {
-    type SelectionUserData = Arc<[u8]>;
+    type SelectionUserData = NiriSelection;
+
+    #[allow(unused_variables)]
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        #[cfg(feature = "remote-desktop")]
+        self.remote_desktop_new_selection(ty, source.as_ref());
+    }
 
     fn send_selection(
         &mut self,
-        _ty: SelectionTarget,
-        _mime_type: String,
+        ty: SelectionTarget,
+        mime_type: String,
         fd: OwnedFd,
         _seat: Seat<Self>,
         user_data: &Self::SelectionUserData,
     ) {
         let _span = tracy_client::span!("send_selection");
 
-        let buf = user_data.clone();
-        thread::spawn(move || {
-            // Clear O_NONBLOCK, otherwise File::write_all() will stop halfway.
-            if let Err(err) = fcntl_setfl(&fd, OFlags::empty()) {
-                warn!("error clearing flags on selection target fd: {err:?}");
+        match user_data {
+            NiriSelection::Bytes(buf) => {
+                let buf = buf.clone();
+                thread::spawn(move || {
+                    // Clear O_NONBLOCK, otherwise File::write_all() will stop halfway.
+                    if let Err(err) = fcntl_setfl(&fd, OFlags::empty()) {
+                        warn!("error clearing flags on selection target fd: {err:?}");
+                    }
+                    if let Err(err) = File::from(fd).write_all(&buf) {
+                        warn!("error writing selection: {err:?}");
+                    }
+                });
             }
-            if let Err(err) = File::from(fd).write_all(&buf) {
-                warn!("error writing selection: {err:?}");
+            #[cfg(feature = "remote-desktop")]
+            NiriSelection::Remote { session, target } => {
+                let (session, target) = (*session, *target);
+                debug_assert_eq!(target, ty);
+                let ty = crate::remote_desktop::clipboard::clipboard_type_of(target);
+                self.remote_desktop_send_selection(session, ty, mime_type, fd);
             }
-        });
+            #[cfg(not(feature = "remote-desktop"))]
+            NiriSelection::Remote { .. } => {
+                let _ = (ty, mime_type, fd);
+            }
+        }
     }
 }
 

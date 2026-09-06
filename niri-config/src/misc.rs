@@ -1,4 +1,7 @@
+use niri_ipc::ConfiguredMode;
+
 use crate::appearance::{Color, WorkspaceShadow, WorkspaceShadowPart, DEFAULT_BACKDROP_COLOR};
+use crate::output::Mode;
 use crate::utils::{Flag, MergeWith};
 use crate::FloatOrInt;
 
@@ -196,5 +199,58 @@ impl MergeWith<XwaylandSatellitePart> for XwaylandSatellite {
         }
 
         merge_clone!((self, part), path);
+    }
+}
+
+/// Configuration for the `org.freedesktop.RemoteDesktop1` D-Bus API.
+///
+/// The whole API is opt-in: it is only started when a `remote-desktop` section is present in the
+/// config, because it lets any peer on the session bus capture the screen and inject input without
+/// any user interaction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteDesktop {
+    /// Allow remote desktop sessions to connect to the EIS input server.
+    pub enable_input: bool,
+    /// Allow remote desktop sessions to integrate with the clipboard.
+    pub enable_clipboard: bool,
+    /// Mode that newly created virtual monitors start with.
+    ///
+    /// A remote desktop service can change it afterwards by negotiating a different size on the
+    /// PipeWire stream.
+    pub virtual_monitor_default_mode: ConfiguredMode,
+}
+
+impl Default for RemoteDesktop {
+    fn default() -> Self {
+        Self {
+            enable_input: false,
+            enable_clipboard: false,
+            virtual_monitor_default_mode: ConfiguredMode {
+                width: 1920,
+                height: 1080,
+                refresh: Some(60.),
+            },
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct RemoteDesktopPart {
+    #[knuffel(child)]
+    pub enable_input: bool,
+    #[knuffel(child)]
+    pub enable_clipboard: bool,
+    #[knuffel(child)]
+    pub virtual_monitor_default_mode: Option<Mode>,
+}
+
+impl MergeWith<RemoteDesktopPart> for RemoteDesktop {
+    fn merge_with(&mut self, part: &RemoteDesktopPart) {
+        self.enable_input |= part.enable_input;
+        self.enable_clipboard |= part.enable_clipboard;
+
+        if let Some(mode) = &part.virtual_monitor_default_mode {
+            self.virtual_monitor_default_mode = mode.mode;
+        }
     }
 }

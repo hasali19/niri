@@ -77,12 +77,43 @@ pub struct PipeWire {
     pub token: RegistrationToken,
     event_loop: LoopHandle<'static, State>,
     to_niri: calloop::channel::Sender<PwToNiri>,
+    /// Serials (`object.serial`) of the PipeWire nodes we've seen, by node id.
+    ///
+    /// The remote desktop API hands these out alongside the node id, so a client can tell node ids
+    /// apart after they get reused.
+    node_serials: Rc<RefCell<HashMap<u32, u64>>>,
+    _registry: pipewire::registry::RegistryRc,
+    _registry_listener: pipewire::registry::Listener,
 }
 
 pub enum PwToNiri {
-    StopCast { session_id: CastSessionId },
-    Redraw { stream_id: CastStreamId },
+    StopCast {
+        session_id: CastSessionId,
+    },
+    Redraw {
+        stream_id: CastStreamId,
+    },
+    /// The stream's PipeWire node id became known.
+    NodeIdReady {
+        stream_id: CastStreamId,
+        node_id: u32,
+    },
+    /// The consumer negotiated a size different from the one we offered.
+    ///
+    /// Only sent for casts of a resizable target (a remote desktop virtual monitor).
+    ResizeTarget {
+        stream_id: CastStreamId,
+        size: Size<u32, Physical>,
+    },
     FatalError,
+}
+
+/// How to tell the API client that the stream's node id is known.
+pub enum CastNotify {
+    /// Emit `org.gnome.Mutter.ScreenCast.Stream.PipeWireStreamAdded`.
+    ScreenCast(SignalEmitter<'static>),
+    /// Send [`PwToNiri::NodeIdReady`]; the remote desktop code replies to the pending D-Bus call.
+    RemoteDesktop,
 }
 
 pub struct Cast {
@@ -207,16 +238,19 @@ impl<'a, E: Element> CursorData<'a, E> {
 
 macro_rules! make_params {
     ($params:ident, $formats:expr, $size:expr, $refresh:expr, $alpha:expr) => {
+        make_params!($params, $formats, $size, $refresh, $alpha, false);
+    };
+    ($params:ident, $formats:expr, $size:expr, $refresh:expr, $alpha:expr, $resizable:expr) => {
         let mut b1 = Vec::new();
         let mut b2 = Vec::new();
 
-        let o1 = make_video_params($formats, $size, $refresh, false);
+        let o1 = make_video_params($formats, $size, $refresh, false, $resizable);
         let pod1 = make_pod(&mut b1, o1);
 
         let mut p1;
         let mut p2;
         $params = if $alpha {
-            let o2 = make_video_params($formats, $size, $refresh, true);
+            let o2 = make_video_params($formats, $size, $refresh, true, $resizable);
             p2 = [pod1, make_pod(&mut b2, o2)];
             &mut p2[..]
         } else {
@@ -257,6 +291,36 @@ impl PipeWire {
                 self.0.loop_().fd()
             }
         }
+        // Track object.serial for every node global, so the remote desktop API can report the
+        // serial of a stream's node together with its id.
+        let node_serials: Rc<RefCell<HashMap<u32, u64>>> = Rc::new(RefCell::new(HashMap::new()));
+        let registry = core.get_registry_rc().context("error getting Registry")?;
+        let registry_listener = registry
+            .add_listener_local()
+            .global({
+                let node_serials = node_serials.clone();
+                move |global| {
+                    if global.type_ != pipewire::types::ObjectType::Node {
+                        return;
+                    }
+                    let Some(props) = global.props else { return };
+                    let Some(serial) = props.get("object.serial") else {
+                        return;
+                    };
+                    let Ok(serial) = serial.parse::<u64>() else {
+                        return;
+                    };
+                    node_serials.borrow_mut().insert(global.id, serial);
+                }
+            })
+            .global_remove({
+                let node_serials = node_serials.clone();
+                move |id| {
+                    node_serials.borrow_mut().remove(&id);
+                }
+            })
+            .register();
+
         let generic = Generic::new(AsFdWrapper(main_loop), Interest::READ, Mode::Level);
         let token = event_loop
             .insert_source(generic, move |_, wrapper, _| {
@@ -272,7 +336,15 @@ impl PipeWire {
             token,
             event_loop,
             to_niri,
+            node_serials,
+            _registry: registry,
+            _registry_listener: registry_listener,
         })
+    }
+
+    /// `object.serial` of a PipeWire node, if we've seen its global.
+    pub fn node_serial(&self, node_id: u32) -> Option<u64> {
+        self.node_serials.borrow().get(&node_id).copied()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -287,7 +359,8 @@ impl PipeWire {
         refresh: u32,
         alpha: bool,
         mut cursor_mode: CursorMode,
-        signal_ctx: SignalEmitter<'static>,
+        notify: CastNotify,
+        resizable: bool,
     ) -> anyhow::Result<Cast> {
         let _span = tracy_client::span!("PipeWire::start_cast");
 
@@ -295,6 +368,18 @@ impl PipeWire {
         let stop_cast = move || {
             if let Err(err) = to_niri_.send(PwToNiri::StopCast { session_id }) {
                 warn!(%session_id, "error sending StopCast to niri: {err:?}");
+            }
+        };
+        let to_niri_ = self.to_niri.clone();
+        let node_id_ready = move |node_id| {
+            if let Err(err) = to_niri_.send(PwToNiri::NodeIdReady { stream_id, node_id }) {
+                warn!(%stream_id, "error sending NodeIdReady to niri: {err:?}");
+            }
+        };
+        let to_niri_ = self.to_niri.clone();
+        let resize_target = move |size| {
+            if let Err(err) = to_niri_.send(PwToNiri::ResizeTarget { stream_id, size }) {
+                warn!(%stream_id, "error sending ResizeTarget to niri: {err:?}");
             }
         };
         let to_niri_ = self.to_niri.clone();
@@ -348,21 +433,31 @@ impl PipeWire {
                             if inner.node_id.is_none() {
                                 let id = stream.node_id();
                                 inner.node_id = Some(id);
-                                debug!("sending signal with {id}");
 
-                                let _span = tracy_client::span!("sending PipeWireStreamAdded");
-                                async_io::block_on(async {
-                                    let res = mutter_screen_cast::Stream::pipe_wire_stream_added(
-                                        &signal_ctx,
-                                        id,
-                                    )
-                                    .await;
+                                match &notify {
+                                    CastNotify::ScreenCast(signal_ctx) => {
+                                        debug!("sending signal with {id}");
 
-                                    if let Err(err) = res {
-                                        warn!("error sending PipeWireStreamAdded: {err:?}");
-                                        stop_cast();
+                                        let _span =
+                                            tracy_client::span!("sending PipeWireStreamAdded");
+                                        async_io::block_on(async {
+                                            let res =
+                                                mutter_screen_cast::Stream::pipe_wire_stream_added(
+                                                    signal_ctx, id,
+                                                )
+                                                .await;
+
+                                            if let Err(err) = res {
+                                                warn!("error sending PipeWireStreamAdded: {err:?}");
+                                                stop_cast();
+                                            }
+                                        });
                                     }
-                                });
+                                    CastNotify::RemoteDesktop => {
+                                        debug!("node id {id} is ready");
+                                        node_id_ready(id);
+                                    }
+                                }
                             }
 
                             inner.is_active = false;
@@ -422,6 +517,15 @@ impl PipeWire {
                     let state = &mut inner.state;
                     if format_size != state.expected_format_size() {
                         if !matches!(&*state, CastState::ResizePending { .. }) {
+                            if resizable {
+                                // The consumer picked a different size out of the range we offered.
+                                // Resize the virtual monitor to match; that comes back as a
+                                // Cast::ensure_size() and re-runs the negotiation.
+                                debug!("consumer negotiated {format_size:?}, resizing the target");
+                                resize_target(format_size);
+                                return;
+                            }
+
                             warn!("wrong size, but we're not resizing");
                             stop_cast();
                             return;
@@ -511,6 +615,7 @@ impl PipeWire {
                             format_size,
                             inner.refresh,
                             format_has_alpha,
+                            false,
                         );
                         let pod1 = make_pod(&mut b1, o1);
 
@@ -519,6 +624,7 @@ impl PipeWire {
                             format_size,
                             inner.refresh,
                             format_has_alpha,
+                            false,
                         );
                         let mut params = [pod1, make_pod(&mut b2, o2)];
 
@@ -795,7 +901,7 @@ impl PipeWire {
         );
 
         let params;
-        make_params!(params, &formats, pending_size, refresh, alpha);
+        make_params!(params, &formats, pending_size, refresh, alpha, resizable);
         stream
             .connect(
                 Direction::Output,
@@ -1246,11 +1352,50 @@ fn pw_version_supports_cursor_metadata() -> bool {
     unsafe { pw_check_library_version(1, 4, 8) }
 }
 
+/// Smallest and largest size we're willing to negotiate for a resizable target.
+const RESIZABLE_MIN: u32 = 64;
+const RESIZABLE_MAX: u32 = 16384;
+
+/// The `VideoSize` format property.
+///
+/// A resizable target offers a range instead of a fixed size, letting the consumer pick the size it
+/// wants; the target is then resized to match.
+fn video_size_property(size: Size<u32, Physical>, resizable: bool) -> Property {
+    let default = Rectangle {
+        width: size.w,
+        height: size.h,
+    };
+
+    if !resizable {
+        return pod::property!(FormatProperties::VideoSize, Rectangle, default);
+    }
+
+    Property {
+        key: FormatProperties::VideoSize.as_raw(),
+        flags: PropertyFlags::empty(),
+        value: pod::Value::Choice(ChoiceValue::Rectangle(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Range {
+                default,
+                min: Rectangle {
+                    width: RESIZABLE_MIN,
+                    height: RESIZABLE_MIN,
+                },
+                max: Rectangle {
+                    width: RESIZABLE_MAX,
+                    height: RESIZABLE_MAX,
+                },
+            },
+        ))),
+    }
+}
+
 fn make_video_params(
     formats: &FormatSet,
     size: Size<u32, Physical>,
     refresh: u32,
     alpha: bool,
+    resizable: bool,
 ) -> pod::Object {
     let format = if alpha {
         VideoFormat::BGRA
@@ -1294,14 +1439,7 @@ fn make_video_params(
                 }
             )))
         },
-        pod::property!(
-            FormatProperties::VideoSize,
-            Rectangle,
-            Rectangle {
-                width: size.w,
-                height: size.h,
-            }
-        ),
+        video_size_property(size, resizable),
         pod::property!(
             FormatProperties::VideoFramerate,
             Fraction,

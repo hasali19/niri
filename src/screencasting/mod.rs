@@ -24,6 +24,7 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
+pub use pw_utils::CastNotify;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
 
 pub struct Screencasting {
@@ -113,10 +114,68 @@ impl State {
         Ok((gbm, render_formats))
     }
 
+    /// Starts a cast of a remote desktop virtual monitor.
+    ///
+    /// Unlike a screen cast started through the Mutter interface, the node id is reported back
+    /// through [`PwToNiri::NodeIdReady`] rather than a D-Bus signal, and the stream is resizable:
+    /// the size the consumer negotiates becomes the size of the virtual monitor.
+    #[cfg(feature = "remote-desktop")]
+    pub fn start_remote_desktop_cast(
+        &mut self,
+        session_id: CastSessionId,
+        stream_id: CastStreamId,
+        output: &Output,
+        cursor_mode: CursorMode,
+    ) -> anyhow::Result<()> {
+        let (size, refresh) = cast_params_for_output(output);
+
+        let (gbm, render_formats) = self.prepare_pw_cast()?;
+        let pw = self.niri.casting.pipewire.as_ref().unwrap();
+
+        let cast = pw.start_cast(
+            gbm,
+            render_formats,
+            session_id,
+            stream_id,
+            CastTarget::output(output),
+            size,
+            refresh,
+            false,
+            cursor_mode,
+            CastNotify::RemoteDesktop,
+            true,
+        )?;
+        self.niri.casting.casts.push(cast);
+
+        Ok(())
+    }
+
     pub fn on_pw_msg(&mut self, msg: PwToNiri) {
         match msg {
             PwToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
             PwToNiri::Redraw { stream_id } => self.redraw_cast(stream_id),
+            PwToNiri::NodeIdReady { stream_id, node_id } => {
+                let serial = self
+                    .niri
+                    .casting
+                    .pipewire
+                    .as_ref()
+                    .and_then(|pw| pw.node_serial(node_id));
+                #[cfg(feature = "remote-desktop")]
+                self.on_remote_desktop_node_id(stream_id, node_id, serial);
+                #[cfg(not(feature = "remote-desktop"))]
+                {
+                    let _ = (stream_id, node_id, serial);
+                }
+            }
+            PwToNiri::ResizeTarget { stream_id, size } => {
+                #[cfg(feature = "remote-desktop")]
+                self.on_remote_desktop_resize_target(stream_id, size);
+                #[cfg(not(feature = "remote-desktop"))]
+                {
+                    let _ = (stream_id, size);
+                }
+            }
             PwToNiri::FatalError => {
                 warn!("stopping PipeWire due to fatal error");
                 let casting = &mut self.niri.casting;
@@ -364,7 +423,8 @@ impl State {
                 refresh,
                 alpha,
                 pending.cursor_mode,
-                pending.signal_ctx,
+                CastNotify::ScreenCast(pending.signal_ctx),
+                false,
             );
             match res {
                 Ok(mut cast) => {
@@ -450,7 +510,8 @@ impl State {
                     refresh,
                     alpha,
                     cursor_mode,
-                    signal_ctx,
+                    CastNotify::ScreenCast(signal_ctx),
+                    false,
                 );
                 match res {
                     Ok(cast) => {
