@@ -95,6 +95,9 @@ pub struct Workspace<W: LayoutElement> {
     /// This workspace's background.
     background_buffer: SolidColorBuffer,
 
+    /// Translucent placeholder left in place of the workspace while it is being dragged.
+    placeholder_buffer: SolidColorBuffer,
+
     /// Clock for driving animations.
     pub(super) clock: Clock,
 
@@ -269,6 +272,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
+            placeholder_buffer: SolidColorBuffer::new(view_size, PLACEHOLDER_COLOR),
             output: Some(output),
             clock,
             base_options,
@@ -332,6 +336,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
+            placeholder_buffer: SolidColorBuffer::new(view_size, PLACEHOLDER_COLOR),
             clock,
             base_options,
             options,
@@ -610,6 +615,7 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         self.background_buffer.resize(size);
+        self.placeholder_buffer.resize(size);
 
         if scale_transform_changed {
             for window in self.windows() {
@@ -1706,6 +1712,15 @@ impl<W: LayoutElement> Workspace<W> {
         self.shadow.render(renderer, Point::from((0., 0.)), push);
     }
 
+    pub fn render_placeholder(&self) -> SolidColorRenderElement {
+        SolidColorRenderElement::from_buffer(
+            &self.placeholder_buffer,
+            Point::new(0., 0.),
+            1.,
+            Kind::Unspecified,
+        )
+    }
+
     pub fn render_background(&self) -> SolidColorRenderElement {
         SolidColorRenderElement::from_buffer(
             &self.background_buffer,
@@ -2103,6 +2118,9 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 }
+
+/// Color of the translucent placeholder left in the slot of a workspace being dragged.
+const PLACEHOLDER_COLOR: [f32; 4] = [0.15, 0.15, 0.15, 0.3];
 
 pub(super) fn compute_working_area(output: &Output) -> Rectangle<f64, Logical> {
     layer_map_for_output(output).non_exclusive_zone().to_f64()
