@@ -99,6 +99,9 @@ pub struct Workspace<W: LayoutElement> {
     /// This workspace's drag handle in the overview.
     handle_buffer: SolidColorBuffer,
 
+    /// Translucent placeholder left in place of the workspace while it is being dragged.
+    placeholder_buffer: SolidColorBuffer,
+
     /// Clock for driving animations.
     pub(super) clock: Clock,
 
@@ -274,6 +277,7 @@ impl<W: LayoutElement> Workspace<W> {
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
             handle_buffer: SolidColorBuffer::default(),
+            placeholder_buffer: SolidColorBuffer::default(),
             output: Some(output),
             clock,
             base_options,
@@ -338,6 +342,7 @@ impl<W: LayoutElement> Workspace<W> {
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
             handle_buffer: SolidColorBuffer::default(),
+            placeholder_buffer: SolidColorBuffer::default(),
             clock,
             base_options,
             options,
@@ -1721,6 +1726,19 @@ impl<W: LayoutElement> Workspace<W> {
             &self.handle_buffer,
             location,
             alpha,
+            Kind::Unspecified,
+        )
+    }
+
+    pub fn update_placeholder(&mut self, size: Size<f64, Logical>, color: Color32F) {
+        self.placeholder_buffer.update(size, color);
+    }
+
+    pub fn render_placeholder(&self) -> SolidColorRenderElement {
+        SolidColorRenderElement::from_buffer(
+            &self.placeholder_buffer,
+            Point::new(0., 0.),
+            1.,
             Kind::Unspecified,
         )
     }

@@ -471,6 +471,13 @@ struct WorkspaceDrag {
     grab_offset: Point<f64, Logical>,
 }
 
+/// A dragged workspace with the monitor to draw it on and the location to draw it at.
+struct WorkspaceDragRender<'a, W: LayoutElement> {
+    mon: &'a Monitor<W>,
+    ws: &'a Workspace<W>,
+    location: Point<f64, Logical>,
+}
+
 /// Animation of a dropped workspace settling into its place.
 #[derive(Debug)]
 struct WorkspaceDropAnim {
@@ -4694,11 +4701,54 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     /// Returns the workspace that is being dragged or is settling after a drop.
-    fn dragged_workspace_id(&self) -> Option<WorkspaceId> {
+    pub fn dragged_workspace_id(&self) -> Option<WorkspaceId> {
         self.workspace_drag
             .as_ref()
             .map(|drag| drag.ws_id)
             .or_else(|| self.workspace_drop_anim.as_ref().map(|a| a.ws_id))
+    }
+
+    /// Returns the dragged workspace and where it is being drawn on the output.
+    fn workspace_drag_render_location(
+        &self,
+        output: &Output,
+    ) -> Option<WorkspaceDragRender<'_, W>> {
+        let mon = self.monitor_for_output(output)?;
+
+        let (ws_id, location) = if let Some(drag) = &self.workspace_drag {
+            if &drag.output != output {
+                return None;
+            }
+
+            let location =
+                drag.pointer_pos_within_output - drag.grab_offset.upscale(mon.overview_zoom());
+            (drag.ws_id, location)
+        } else if let Some(drop) = &self.workspace_drop_anim {
+            if &drop.output != output {
+                return None;
+            }
+
+            let (_, geo) = mon
+                .workspaces_with_render_geo_cull(false)
+                .find(|(ws, _)| ws.id() == drop.ws_id)?;
+
+            (drop.ws_id, geo.loc + drop.delta.upscale(drop.anim.value()))
+        } else {
+            return None;
+        };
+
+        let (_, _, ws) = self.workspaces().find(|(_, _, ws)| ws.id() == ws_id)?;
+        Some(WorkspaceDragRender { mon, ws, location })
+    }
+
+    /// Returns the workspace being dragged on this output and where it is drawn.
+    pub fn workspace_drag_render_info(
+        &self,
+        output: &Output,
+    ) -> Option<(WorkspaceId, Rectangle<f64, Logical>)> {
+        let WorkspaceDragRender { mon, ws, location } =
+            self.workspace_drag_render_location(output)?;
+        Some((ws.id(), mon.dragged_workspace_geo(location)))
     }
 
     pub fn render_workspace_drag_for_output<R: NiriRenderer>(
@@ -4712,40 +4762,28 @@ impl<W: LayoutElement> Layout<W> {
             error!("clock moved between updating render elements and rendering");
         }
 
-        let Some(mon) = self.monitor_for_output(output) else {
-            return;
-        };
-
-        let (ws_id, location) = if let Some(drag) = &self.workspace_drag {
-            if &drag.output != output {
-                return;
-            }
-
-            let location =
-                drag.pointer_pos_within_output - drag.grab_offset.upscale(mon.overview_zoom());
-            (drag.ws_id, location)
-        } else if let Some(drop) = &self.workspace_drop_anim {
-            if &drop.output != output {
-                return;
-            }
-
-            let Some((_, geo)) = mon
-                .workspaces_with_render_geo_cull(false)
-                .find(|(ws, _)| ws.id() == drop.ws_id)
-            else {
-                return;
-            };
-
-            (drop.ws_id, geo.loc + drop.delta.upscale(drop.anim.value()))
-        } else {
-            return;
-        };
-
-        let Some((_, _, ws)) = self.workspaces().find(|(_, _, ws)| ws.id() == ws_id) else {
+        let Some(WorkspaceDragRender { mon, ws, location }) =
+            self.workspace_drag_render_location(output)
+        else {
             return;
         };
 
         mon.render_dragged_workspace(ws, location, ctx, focus_ring, push);
+    }
+
+    pub fn render_workspace_drag_background_for_output<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        let Some(WorkspaceDragRender { mon, ws, location }) =
+            self.workspace_drag_render_location(output)
+        else {
+            return;
+        };
+
+        mon.render_dragged_workspace_background(ws, location, renderer, push);
     }
 
     pub fn workspace_drag_id(&self) -> Option<WorkspaceId> {

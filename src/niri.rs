@@ -4571,15 +4571,6 @@ impl Niri {
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
-            self.layout.render_workspace_drag_for_output(
-                ctx.r(),
-                output,
-                focus_ring,
-                &mut |elem| push(elem.into()),
-            );
-
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
-
             // Macro instead of closure to avoid borrowing push().
             macro_rules! process {
                 ($geo:expr) => {{
@@ -4591,7 +4582,42 @@ impl Niri {
                 }};
             }
 
+            // The dragged workspace is drawn on top of everything else, with its own copies of the
+            // per-workspace layers (wallpaper), and a translucent placeholder is left in its place.
+            if let Some((ws_id, geo)) = self.layout.workspace_drag_render_info(output) {
+                // Distinct from the namespace of the placeholder's workspace.
+                let ns = Some(ws_id.get() as usize ^ (1 << (usize::BITS - 1)));
+                let xray_pos = XrayPos::new(geo.loc, zoom);
+
+                push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
+                push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+
+                self.layout.render_workspace_drag_for_output(
+                    ctx.r(),
+                    output,
+                    focus_ring,
+                    &mut |elem| push(elem.into()),
+                );
+
+                push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
+                push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+
+                self.layout.render_workspace_drag_background_for_output(
+                    ctx.renderer,
+                    output,
+                    &mut |elem| push(elem.into()),
+                );
+            }
+
+            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+
+            let dragged_ws_id = self.layout.dragged_workspace_id();
+
             for (ws, geo) in mon.workspaces_with_render_geo() {
+                if Some(ws.id()) == dragged_ws_id {
+                    continue;
+                }
+
                 let ns = Some(ws.id().get() as usize);
                 let xray_pos = XrayPos::new(geo.loc, zoom);
                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
@@ -4609,6 +4635,11 @@ impl Niri {
                 // requirement is that there's only one framebuffer effect element with a given id +
                 // namespace on the frame at once. Id + namespace is used as the cache key in the
                 // damage tracker.
+                if Some(ws.id()) == dragged_ws_id {
+                    process!(geo)(ws.render_placeholder());
+                    continue;
+                }
+
                 let ns = Some(ws.id().get() as usize);
                 let xray_pos = XrayPos::new(geo.loc, zoom);
                 push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
