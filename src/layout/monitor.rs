@@ -1139,6 +1139,10 @@ impl<W: LayoutElement> Monitor<W> {
         for (ws, geo) in self.workspaces_with_render_geo_mut(true) {
             ws.update_render_elements(is_active, RenderLayer::Normal);
 
+            if Some(ws.id()) == dragged_workspace {
+                ws.update_placeholder(ws.view_size(), Color32F::from([0.15, 0.15, 0.15, 0.3]));
+            }
+
             if is_overview {
                 let (_, handle) = workspace_handle_geo(geo, handle_gap, handle_scale);
                 let alpha = if Some(ws.id()) == dragged_workspace {
@@ -1936,10 +1940,6 @@ impl<W: LayoutElement> Monitor<W> {
 
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
-        let alpha = self
-            .overview_progress
-            .as_ref()
-            .map_or(1., |p| p.clamped_value().clamp(0., 1.)) as f32;
 
         let loc = location.to_physical_precise_round(scale).to_logical(scale);
         let xray_pos = XrayPos::new(loc, zoom);
@@ -1988,15 +1988,52 @@ impl<W: LayoutElement> Monitor<W> {
                 _ => ws.render_scrolling(ctx.r(), xray_pos, focus_ring, RenderLayer::Normal, push),
             }
         }
+    }
+
+    /// Renders the background and the shadow of a workspace being dragged in the overview.
+    pub(super) fn render_dragged_workspace_background<R: NiriRenderer>(
+        &self,
+        ws: &Workspace<W>,
+        location: Point<f64, Logical>,
+        renderer: &mut R,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        let scale = self.scale.fractional_scale();
+        let zoom = self.overview_zoom();
+        let alpha = self
+            .overview_progress
+            .as_ref()
+            .map_or(1., |p| p.clamped_value().clamp(0., 1.)) as f32;
+
+        let loc = location.to_physical_precise_round(scale).to_logical(scale);
+
+        let scale_relocate = move |elem| {
+            let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
+            RelocateRenderElement::from_element(
+                elem,
+                loc.to_physical_precise_round(scale),
+                Relocate::Relative,
+            )
+        };
 
         push(scale_relocate(MonitorInnerRenderElement::SolidColor(
             ws.render_background(),
         )));
 
-        ws.render_shadow(ctx.renderer, &mut |elem| {
+        ws.render_shadow(renderer, &mut |elem| {
             let elem = MonitorInnerRenderElement::Shadow(elem.with_alpha(alpha));
             push(scale_relocate(elem));
         });
+    }
+
+    /// Returns the geometry of a workspace being dragged in the overview.
+    pub(super) fn dragged_workspace_geo(
+        &self,
+        location: Point<f64, Logical>,
+    ) -> Rectangle<f64, Logical> {
+        let scale = self.scale.fractional_scale();
+        let loc = location.to_physical_precise_round(scale).to_logical(scale);
+        Rectangle::new(loc, self.workspace_size(self.overview_zoom()))
     }
 
     pub fn render_workspace_handles<R: NiriRenderer>(
