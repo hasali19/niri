@@ -2918,16 +2918,26 @@ impl<W: LayoutElement> Layout<W> {
             .workspace_drag
             .as_ref()
             .map(|drag| &drag.output)
-            .or_else(|| self.workspace_drop_anim.as_ref().map(|a| &a.output));
-        if drag_output.is_some_and(|drag_output| output.is_none_or(|output| drag_output == output))
+            .or_else(|| self.workspace_drop_anim.as_ref().map(|a| &a.output))
+            .cloned();
+        if drag_output
+            .as_ref()
+            .is_some_and(|drag_output| output.is_none_or(|output| drag_output == output))
         {
             // The dragged workspace may be off-screen or on a different monitor, so update its
             // elements explicitly.
             let is_active = self.is_active;
+            let handle_params = drag_output
+                .and_then(|output| self.monitor_for_output(&output))
+                .map(|mon| mon.dragged_handle_params());
             if let Some(ws_id) = self.dragged_workspace_id() {
                 if let Some(ws) = self.workspaces_mut().find(|ws| ws.id() == ws_id) {
                     ws.update_render_elements(is_active, RenderLayer::MovingBetweenWorkspaces);
                     ws.update_render_elements(is_active, RenderLayer::Normal);
+
+                    if let Some((size, scale, alpha)) = handle_params {
+                        ws.update_handle(size, true, scale, alpha);
+                    }
                 }
             }
         }
@@ -4769,6 +4779,21 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         mon.render_dragged_workspace(ws, location, ctx, focus_ring, push);
+    }
+
+    pub fn render_workspace_drag_handle_for_output<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        let Some(WorkspaceDragRender { mon, ws, location }) =
+            self.workspace_drag_render_location(output)
+        else {
+            return;
+        };
+
+        mon.render_dragged_workspace_handle(ws, location, renderer, push);
     }
 
     pub fn render_workspace_drag_background_for_output<R: NiriRenderer>(

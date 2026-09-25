@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use niri_config::utils::MergeWith as _;
 use niri_config::{
-    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, Workspace as WorkspaceConfig,
+    CenterFocusedColumn, Color, CornerRadius, OutputName, PresetSize, Workspace as WorkspaceConfig,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::Kind;
@@ -19,6 +19,7 @@ use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
+use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
 };
@@ -97,7 +98,7 @@ pub struct Workspace<W: LayoutElement> {
     background_buffer: SolidColorBuffer,
 
     /// This workspace's drag handle in the overview.
-    handle_buffer: SolidColorBuffer,
+    handle: FocusRing,
 
     /// Translucent placeholder left in place of the workspace while it is being dragged.
     placeholder_buffer: SolidColorBuffer,
@@ -276,7 +277,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
-            handle_buffer: SolidColorBuffer::default(),
+            handle: FocusRing::new(handle_config()),
             placeholder_buffer: SolidColorBuffer::default(),
             output: Some(output),
             clock,
@@ -341,7 +342,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
-            handle_buffer: SolidColorBuffer::default(),
+            handle: FocusRing::new(handle_config()),
             placeholder_buffer: SolidColorBuffer::default(),
             clock,
             base_options,
@@ -457,6 +458,7 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.update_shaders();
         self.floating.update_shaders();
         self.shadow.update_shaders();
+        self.handle.update_shaders();
     }
 
     pub fn windows(&self) -> impl Iterator<Item = &W> + '_ {
@@ -1713,21 +1715,28 @@ impl<W: LayoutElement> Workspace<W> {
         self.shadow.render(renderer, Point::from((0., 0.)), push);
     }
 
-    pub fn update_handle(&mut self, size: Size<f64, Logical>, color: Color32F) {
-        self.handle_buffer.update(size, color);
+    pub fn update_handle(
+        &mut self,
+        size: Size<f64, Logical>,
+        is_dragged: bool,
+        scale: f64,
+        alpha: f32,
+    ) {
+        // Fully rounded ends.
+        let radius = CornerRadius::from((size.h / 2.) as f32);
+        let view_rect = Rectangle::from_size(size);
+        self.handle.update_render_elements(
+            size, is_dragged, false, false, view_rect, radius, scale, alpha,
+        );
     }
 
     pub fn render_handle(
         &self,
+        renderer: &mut impl NiriRenderer,
         location: Point<f64, Logical>,
-        alpha: f32,
-    ) -> SolidColorRenderElement {
-        SolidColorRenderElement::from_buffer(
-            &self.handle_buffer,
-            location,
-            alpha,
-            Kind::Unspecified,
-        )
+        push: &mut dyn FnMut(FocusRingRenderElement),
+    ) {
+        self.handle.render(renderer, location, push);
     }
 
     pub fn update_placeholder(&mut self, size: Size<f64, Logical>, color: Color32F) {
@@ -2143,6 +2152,22 @@ impl<W: LayoutElement> Workspace<W> {
 
 pub(super) fn compute_working_area(output: &Output) -> Rectangle<f64, Logical> {
     layer_map_for_output(output).non_exclusive_zone().to_f64()
+}
+
+/// Config for the drag handle in the overview.
+///
+/// The active color is used while the workspace is being dragged.
+fn handle_config() -> niri_config::FocusRing {
+    niri_config::FocusRing {
+        off: false,
+        width: 0.,
+        active_color: Color::new_unpremul(1., 1., 1., 0.9),
+        inactive_color: Color::new_unpremul(1., 1., 1., 0.5),
+        urgent_color: Color::new_unpremul(1., 1., 1., 0.5),
+        active_gradient: None,
+        inactive_gradient: None,
+        urgent_gradient: None,
+    }
 }
 
 fn compute_workspace_shadow_config(
