@@ -3384,6 +3384,31 @@ impl Niri {
         Some((output.clone(), ws))
     }
 
+    /// Returns the workspace whose overview drag handle is under the position.
+    ///
+    /// The return value is an output, the position within it and a workspace id.
+    pub fn workspace_handle_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(Output, Point<f64, Logical>, WorkspaceId)> {
+        if self.exit_confirm_dialog.is_open() || self.is_locked() || self.screenshot_ui.is_open() {
+            return None;
+        }
+
+        let (output, pos_within_output) = self.output_under(pos)?;
+
+        if self.is_sticky_obscured_under(output, pos_within_output)
+            || self.is_layout_obscured_under(output, pos_within_output)
+        {
+            return None;
+        }
+
+        let ws_id = self
+            .layout
+            .workspace_handle_under(output, pos_within_output)?;
+        Some((output.clone(), pos_within_output, ws_id))
+    }
+
     pub fn workspace_under_cursor(
         &self,
         extended_bounds: bool,
@@ -4546,6 +4571,13 @@ impl Niri {
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
+            self.layout.render_workspace_drag_for_output(
+                ctx.r(),
+                output,
+                focus_ring,
+                &mut |elem| push(elem.into()),
+            );
+
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
 
             // Macro instead of closure to avoid borrowing push().
@@ -4586,6 +4618,7 @@ impl Niri {
             }
         }
 
+        mon.render_workspace_handles(&mut |elem| push(elem.into()));
         mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
 
         // Then the backdrop.

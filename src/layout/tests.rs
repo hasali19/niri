@@ -3851,6 +3851,152 @@ fn workspace_render_geo_at_fractional_scale() {
     );
 }
 
+fn workspace_drag_setup() -> Layout<TestWindow> {
+    let ops = [
+        Op::AddOutput(0),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::FocusWorkspaceDown,
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::FocusWorkspaceDown,
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusWorkspaceUp,
+        Op::ToggleOverview,
+        Op::CompleteAnimations,
+    ];
+    check_ops(ops)
+}
+
+fn workspace_ids(layout: &Layout<TestWindow>) -> Vec<WorkspaceId> {
+    layout.workspaces().map(|(_, _, ws)| ws.id()).collect()
+}
+
+#[test]
+fn workspace_drag_reorders_in_overview() {
+    let mut layout = workspace_drag_setup();
+    let ids = workspace_ids(&layout);
+    assert_eq!(ids.len(), 4);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    let output = mon.output().clone();
+
+    // Grab the handle of the second workspace (which is centered).
+    let geos: Vec<_> = mon.workspaces_with_render_geo_cull(false).collect();
+    let geo = geos[1].1;
+    let handle_pos = Point::from((geo.loc.x + geo.size.w / 2., geo.loc.y - 1.));
+    assert_eq!(
+        layout.workspace_handle_under(&output, handle_pos),
+        Some(ids[1])
+    );
+
+    // The empty workspace has no handle.
+    let geo = geos[3].1;
+    let handle_pos = Point::from((geo.loc.x + geo.size.w / 2., geo.loc.y - 1.));
+    assert_eq!(layout.workspace_handle_under(&output, handle_pos), None);
+
+    // Drag it above the first workspace.
+    let top = geos[0].1.loc.y + 1.;
+    let pos = Point::from((geo.loc.x + geo.size.w / 2., top));
+    assert!(layout.workspace_drag_begin(ids[1], output.clone(), pos));
+    assert!(layout.workspace_drag_update(output, pos));
+    layout.workspace_drag_end(true);
+    layout.verify_invariants();
+
+    let new_ids = workspace_ids(&layout);
+    assert_eq!(new_ids, [ids[1], ids[0], ids[2], ids[3]]);
+
+    // The dropped workspace animates into place, then the animation goes away.
+    assert!(layout.workspace_drop_anim.is_some());
+    check_ops_on_layout(&mut layout, [Op::AdvanceAnimations { msec_delta: 1000 }]);
+    check_ops_on_layout(&mut layout, [Op::AdvanceAnimations { msec_delta: 1000 }]);
+    assert!(layout.workspace_drop_anim.is_none());
+
+    // The view ends up centered on the dropped workspace.
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    assert_eq!(mon.workspaces[mon.active_workspace_idx].id(), ids[1]);
+    assert_eq!(mon.workspace_render_idx(), mon.active_workspace_idx as f64);
+}
+
+#[test]
+fn workspace_drag_cancel_and_noop_keep_order() {
+    let mut layout = workspace_drag_setup();
+    let ids = workspace_ids(&layout);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    let output = mon.output().clone();
+    let geos: Vec<_> = mon
+        .workspaces_with_render_geo_cull(false)
+        .map(|(_, geo)| geo)
+        .collect();
+
+    // Dropping far below moves to the end, before the empty workspace.
+    let bottom = Point::from((0., geos[3].loc.y + 1000.));
+    assert!(layout.workspace_drag_begin(ids[0], output.clone(), bottom));
+    layout.workspace_drag_end(false);
+    assert_eq!(workspace_ids(&layout), ids);
+
+    // Dropping in place is a no-op.
+    let own = Point::from((0., geos[1].loc.y + 1.));
+    assert!(layout.workspace_drag_begin(ids[1], output.clone(), own));
+    layout.workspace_drag_end(true);
+    assert_eq!(workspace_ids(&layout), ids);
+
+    assert!(layout.workspace_drag_begin(ids[0], output, bottom));
+    layout.workspace_drag_end(true);
+    layout.verify_invariants();
+    let new_ids = workspace_ids(&layout);
+    assert_eq!(new_ids[..3], [ids[1], ids[2], ids[0]]);
+}
+
+#[test]
+fn workspace_drag_scrolls_at_screen_edge() {
+    let mut layout = workspace_drag_setup();
+    let ids = workspace_ids(&layout);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    let output = mon.output().clone();
+    let view_size = mon.view_size();
+    let first_y = mon.workspaces_render_geo().next().unwrap().loc.y;
+
+    // Hold the pointer at the bottom edge of the strip of workspaces.
+    let pos = Point::from((view_size.w / 2., view_size.h - 1.));
+    assert!(layout.workspace_drag_begin(ids[1], output.clone(), pos));
+    assert!(layout.workspace_drag_update(output.clone(), pos));
+
+    for _ in 0..10 {
+        Op::AdvanceAnimations { msec_delta: 100 }.apply(&mut layout);
+    }
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let scrolled_y = monitors[0].workspaces_render_geo().next().unwrap().loc.y;
+    assert!(
+        scrolled_y < first_y,
+        "the view must scroll down while the pointer is at the bottom edge"
+    );
+
+    layout.workspace_drag_end(false);
+    layout.verify_invariants();
+}
+
 fn parent_id_causes_loop(layout: &Layout<TestWindow>, id: usize, mut parent_id: usize) -> bool {
     if parent_id == id {
         return true;
