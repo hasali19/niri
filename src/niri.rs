@@ -3384,6 +3384,31 @@ impl Niri {
         Some((output.clone(), ws))
     }
 
+    /// Returns the workspace whose overview drag handle is under the position.
+    ///
+    /// The return value is an output, the position within it and a workspace id.
+    pub fn workspace_handle_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(Output, Point<f64, Logical>, WorkspaceId)> {
+        if self.exit_confirm_dialog.is_open() || self.is_locked() || self.screenshot_ui.is_open() {
+            return None;
+        }
+
+        let (output, pos_within_output) = self.output_under(pos)?;
+
+        if self.is_sticky_obscured_under(output, pos_within_output)
+            || self.is_layout_obscured_under(output, pos_within_output)
+        {
+            return None;
+        }
+
+        let ws_id = self
+            .layout
+            .workspace_handle_under(output, pos_within_output)?;
+        Some((output.clone(), pos_within_output, ws_id))
+    }
+
     pub fn workspace_under_cursor(
         &self,
         extended_bounds: bool,
@@ -4267,7 +4292,13 @@ impl Niri {
 
                 state.xray.workspaces.clear();
                 let mon = self.layout.monitor_for_output(out).unwrap();
+                let dragged_ws_id = self.layout.dragged_workspace_id();
                 for (ws, geo) in mon.workspaces_with_render_geo() {
+                    // The dragged workspace doesn't draw its background in place.
+                    if Some(ws.id()) == dragged_ws_id {
+                        continue;
+                    }
+
                     let bg_color = ws.render_background().color();
                     state.xray.workspaces.push((geo, bg_color));
                 }
@@ -4546,8 +4577,6 @@ impl Niri {
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
-
             // Macro instead of closure to avoid borrowing push().
             macro_rules! process {
                 ($geo:expr) => {{
@@ -4559,7 +4588,60 @@ impl Niri {
                 }};
             }
 
+            // The dragged workspace is drawn on top of everything else, with its own copies of the
+            // per-workspace layers (wallpaper), and a translucent placeholder is left in its place.
+            if let Some((ws_id, geo, bg_color)) = self.layout.workspace_drag_render_info(output) {
+                // Distinct from the namespace of the placeholder's workspace.
+                let ns = Some(ws_id.get() as usize ^ (1 << (usize::BITS - 1)));
+                let xray_pos = XrayPos::new(geo.loc, zoom);
+
+                // The handle goes first (on top) so that it doesn't get hidden by the workspace
+                // it is dragged over.
+                self.layout.render_workspace_drag_handle_for_output(
+                    ctx.renderer,
+                    output,
+                    &mut |elem| push(elem.into()),
+                );
+
+                push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
+                push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+
+                // The xray background of the windows must match where the workspace is now, rather
+                // than the workspaces' places in the layout.
+                let drag_xray = ctx
+                    .xray
+                    .map(|xray| xray.with_workspaces(vec![(geo, bg_color)]));
+                let drag_ctx = RenderCtx {
+                    renderer: &mut *ctx.renderer,
+                    target: ctx.target,
+                    xray: drag_xray.as_ref(),
+                };
+                self.layout.render_workspace_drag_for_output(
+                    drag_ctx,
+                    output,
+                    focus_ring,
+                    &mut |elem| push(elem.into()),
+                );
+
+                push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
+                push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+
+                self.layout.render_workspace_drag_background_for_output(
+                    ctx.renderer,
+                    output,
+                    &mut |elem| push(elem.into()),
+                );
+            }
+
+            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+
+            let dragged_ws_id = self.layout.dragged_workspace_id();
+
             for (ws, geo) in mon.workspaces_with_render_geo() {
+                if Some(ws.id()) == dragged_ws_id {
+                    continue;
+                }
+
                 let ns = Some(ws.id().get() as usize);
                 let xray_pos = XrayPos::new(geo.loc, zoom);
                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
@@ -4577,6 +4659,11 @@ impl Niri {
                 // requirement is that there's only one framebuffer effect element with a given id +
                 // namespace on the frame at once. Id + namespace is used as the cache key in the
                 // damage tracker.
+                if Some(ws.id()) == dragged_ws_id {
+                    process!(geo)(ws.render_placeholder());
+                    continue;
+                }
+
                 let ns = Some(ws.id().get() as usize);
                 let xray_pos = XrayPos::new(geo.loc, zoom);
                 push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
@@ -4586,6 +4673,7 @@ impl Niri {
             }
         }
 
+        mon.render_workspace_handles(ctx.renderer, &mut |elem| push(elem.into()));
         mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
 
         // Then the backdrop.
