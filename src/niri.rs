@@ -4589,6 +4589,14 @@ impl Niri {
                 let ns = Some(ws_id.get() as usize ^ (1 << (usize::BITS - 1)));
                 let xray_pos = XrayPos::new(geo.loc, zoom);
 
+                // The handle goes first (on top) so that it doesn't get hidden by the workspace
+                // it is dragged over.
+                self.layout.render_workspace_drag_handle_for_output(
+                    ctx.renderer,
+                    output,
+                    &mut |elem| push(elem.into()),
+                );
+
                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
@@ -4649,7 +4657,7 @@ impl Niri {
             }
         }
 
-        mon.render_workspace_handles(&mut |elem| push(elem.into()));
+        mon.render_workspace_handles(ctx.renderer, &mut |elem| push(elem.into()));
         mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
 
         // Then the backdrop.
