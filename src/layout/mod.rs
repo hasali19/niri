@@ -46,6 +46,7 @@ use scrolling::{Column, ColumnWidth};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::Color32F;
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
@@ -4751,14 +4752,16 @@ impl<W: LayoutElement> Layout<W> {
         Some(WorkspaceDragRender { mon, ws, location })
     }
 
-    /// Returns the workspace being dragged on this output and where it is drawn.
+    /// Returns the workspace being dragged on this output, where it is drawn, and its background
+    /// color.
     pub fn workspace_drag_render_info(
         &self,
         output: &Output,
-    ) -> Option<(WorkspaceId, Rectangle<f64, Logical>)> {
+    ) -> Option<(WorkspaceId, Rectangle<f64, Logical>, Color32F)> {
         let WorkspaceDragRender { mon, ws, location } =
             self.workspace_drag_render_location(output)?;
-        Some((ws.id(), mon.dragged_workspace_geo(location)))
+        let bg_color = ws.render_background().color();
+        Some((ws.id(), mon.dragged_workspace_geo(location), bg_color))
     }
 
     pub fn render_workspace_drag_for_output<R: NiriRenderer>(

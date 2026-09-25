@@ -4292,7 +4292,13 @@ impl Niri {
 
                 state.xray.workspaces.clear();
                 let mon = self.layout.monitor_for_output(out).unwrap();
+                let dragged_ws_id = self.layout.dragged_workspace_id();
                 for (ws, geo) in mon.workspaces_with_render_geo() {
+                    // The dragged workspace doesn't draw its background in place.
+                    if Some(ws.id()) == dragged_ws_id {
+                        continue;
+                    }
+
                     let bg_color = ws.render_background().color();
                     state.xray.workspaces.push((geo, bg_color));
                 }
@@ -4584,7 +4590,7 @@ impl Niri {
 
             // The dragged workspace is drawn on top of everything else, with its own copies of the
             // per-workspace layers (wallpaper), and a translucent placeholder is left in its place.
-            if let Some((ws_id, geo)) = self.layout.workspace_drag_render_info(output) {
+            if let Some((ws_id, geo, bg_color)) = self.layout.workspace_drag_render_info(output) {
                 // Distinct from the namespace of the placeholder's workspace.
                 let ns = Some(ws_id.get() as usize ^ (1 << (usize::BITS - 1)));
                 let xray_pos = XrayPos::new(geo.loc, zoom);
@@ -4600,8 +4606,18 @@ impl Niri {
                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
+                // The xray background of the windows must match where the workspace is now, rather
+                // than the workspaces' places in the layout.
+                let drag_xray = ctx
+                    .xray
+                    .map(|xray| xray.with_workspaces(vec![(geo, bg_color)]));
+                let drag_ctx = RenderCtx {
+                    renderer: &mut *ctx.renderer,
+                    target: ctx.target,
+                    xray: drag_xray.as_ref(),
+                };
                 self.layout.render_workspace_drag_for_output(
-                    ctx.r(),
+                    drag_ctx,
                     output,
                     focus_ring,
                     &mut |elem| push(elem.into()),
