@@ -18,6 +18,9 @@ While in the overview, all keyboard shortcuts keep working, while pointing devic
 - Touchpad: two-finger scrolling that matches the normal three-finger gestures.
 - Touchscreen: one-finger scrolling, or one-finger long press to move a window.
 
+Every non-empty workspace has a drag handle in the gap above it.
+Drag the handle with the mouse, a touchscreen or a tablet tool to move the whole workspace: a line shows where it will land, and dropping it on another monitor moves it there.
+
 > [!TIP]
 > The overview needs to draw a background under every workspace.
 > So, layer-shell surfaces work this way: the *background* and *bottom* layers zoom out together with the workspaces, while the *top* and *overlay* layers remain on top of the overview.
