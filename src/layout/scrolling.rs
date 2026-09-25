@@ -7,8 +7,9 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{CenterFocusedColumn, PresetSize, Struts};
 use niri_ipc::{ColumnDisplay, SizeChange, WindowLayout};
 use ordered_float::NotNan;
+use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::monitor::InsertPosition;
@@ -98,6 +99,7 @@ pub struct ScrollingSpace<W: LayoutElement> {
 niri_render_elements! {
     ScrollingSpaceRenderElement<R> => {
         Tile = TileRenderElement<R>,
+        CroppedTile = CropRenderElement<TileRenderElement<R>>,
         ClosingWindow = ClosingWindowRenderElement,
         TabIndicator = TabIndicatorRenderElement,
     }
@@ -218,6 +220,9 @@ pub struct Column<W: LayoutElement> {
     /// Animation of a column visually moving vertically.
     move_y_animation: Option<MoveAnimation>,
 
+    /// Animation of the windows sliding when switching the active tab in tabbed mode.
+    tab_switch_animation: Option<TabSwitchAnimation<W::Id>>,
+
     /// Latest known view size for this column's workspace.
     view_size: Size<f64, Logical>,
 
@@ -310,6 +315,27 @@ struct MoveAnimation {
     ///
     /// Controls whether the tile is rendered uncropped and above others.
     is_between_workspaces: bool,
+}
+
+#[derive(Debug)]
+struct TabSwitchAnimation<Id> {
+    anim: Animation,
+    from: Id,
+    /// 1 when switching to a tab below, -1 when switching to a tab above.
+    direction: f64,
+}
+
+/// State of an ongoing tab switch animation, resolved for rendering.
+#[derive(Debug, Clone, Copy)]
+struct TabSwitchOffsets {
+    /// Index of the tile sliding out.
+    from_idx: usize,
+    /// Vertical render offset of the active tile.
+    active_dy: f64,
+    /// Vertical render offset of the tile sliding out.
+    from_dy: f64,
+    /// Height of the area that the sliding tiles are cropped to.
+    height: f64,
 }
 
 impl<W: LayoutElement> ScrollingSpace<W> {
@@ -2983,10 +3009,30 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     .render(ctx.renderer, pos, &mut |elem| push(elem.into()));
             }
 
-            for (tile, tile_off, visible) in col.tiles_in_render_order() {
+            // During a tab switch, the active and the previous tiles slide within the tile area,
+            // so crop them to it.
+            let tab_switch = col.tab_switch_offsets().map(|tab_switch| {
+                let y = col_pos.y + col.tiles_origin().y;
+                let area =
+                    Rectangle::new(Point::from((0., y)), Size::from((0., tab_switch.height)));
+                let area = area.to_physical_precise_round(scale);
+                // Keep the crop infinite horizontally to avoid cutting off shaders and borders.
+                let crop = Rectangle::<i32, Physical>::new(
+                    Point::from((-i32::MAX / 2, area.loc.y)),
+                    Size::from((i32::MAX, area.size.h)),
+                );
+                (&col.tiles[tab_switch.from_idx], crop)
+            });
+
+            for (idx, (tile, tile_off, visible)) in col.tiles_in_render_order().enumerate() {
                 let tile_pos = col_pos + tile_off + tile.render_offset();
                 // Round to physical pixels.
                 let tile_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
+
+                // The active tile comes first in the render order.
+                let crop = tab_switch.and_then(|(from_tile, crop)| {
+                    (idx == 0 || std::ptr::eq(tile, from_tile)).then_some(crop)
+                });
 
                 // And now the drawing logic.
 
@@ -2999,15 +3045,26 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 // mode, so we don't want to apply "visible" immediately. However, "visible" is
                 // also used for input handling, and there we *do* want to apply it immediately.
                 // So, let's just selectively ignore "visible" here when animating alpha.
-                let visible = visible || tile.alpha_animation.is_some();
+                //
+                // Similarly, the previous tile is hidden for input, but still drawn while it slides
+                // out during a tab switch.
+                let visible = visible || tile.alpha_animation.is_some() || crop.is_some();
                 if !visible {
                     continue;
                 }
 
                 let xray_pos = xray_pos.offset(tile_pos);
-                tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
-                    push(elem.into())
-                });
+                if let Some(crop) = crop {
+                    tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
+                        if let Some(elem) = CropRenderElement::from_element(elem, scale, crop) {
+                            push(elem.into());
+                        }
+                    });
+                } else {
+                    tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
+                        push(elem.into())
+                    });
+                }
             }
         }
     }
@@ -4014,6 +4071,7 @@ impl<W: LayoutElement> Column<W> {
             tab_indicator: TabIndicator::new(options.layout.tab_indicator),
             move_x_animation: None,
             move_y_animation: None,
+            tab_switch_animation: None,
             view_size,
             working_area,
             parent_area,
@@ -4131,6 +4189,12 @@ impl<W: LayoutElement> Column<W> {
             }
         }
 
+        if let Some(tab_switch) = &self.tab_switch_animation {
+            if tab_switch.anim.is_done() {
+                self.tab_switch_animation = None;
+            }
+        }
+
         for tile in &mut self.tiles {
             tile.advance_animations();
         }
@@ -4141,6 +4205,7 @@ impl<W: LayoutElement> Column<W> {
     pub fn are_animations_ongoing(&self) -> bool {
         self.move_x_animation.is_some()
             || self.move_y_animation.is_some()
+            || self.tab_switch_animation.is_some()
             || self.tab_indicator.are_animations_ongoing()
             || self.tiles.iter().any(Tile::are_animations_ongoing)
     }
@@ -4148,6 +4213,7 @@ impl<W: LayoutElement> Column<W> {
     pub fn are_transitions_ongoing(&self) -> bool {
         self.move_x_animation.is_some()
             || self.move_y_animation.is_some()
+            || self.tab_switch_animation.is_some()
             || self.tab_indicator.are_animations_ongoing()
             || self.tiles.iter().any(Tile::are_transitions_ongoing)
     }
@@ -4182,8 +4248,17 @@ impl<W: LayoutElement> Column<W> {
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
         let active_idx = self.active_tile_idx;
-        for (tile_idx, (tile, tile_off)) in self.tiles_mut().enumerate() {
+        let tab_switch = self.tab_switch_offsets();
+        for (tile_idx, (tile, mut tile_off)) in self.tiles_mut().enumerate() {
             let is_active = is_active && tile_idx == active_idx;
+
+            if let Some(tab_switch) = tab_switch {
+                if tile_idx == active_idx {
+                    tile_off.y += tab_switch.active_dy;
+                } else if tile_idx == tab_switch.from_idx {
+                    tile_off.y += tab_switch.from_dy;
+                }
+            }
 
             let mut tile_view_rect = view_rect;
             tile_view_rect.loc -= tile_off + tile.render_offset();
@@ -4420,9 +4495,83 @@ impl<W: LayoutElement> Column<W> {
         true
     }
 
+    /// Activates the tile at `idx`, animating the switch if the column is tabbed.
+    fn switch_to_idx(&mut self, idx: usize) -> bool {
+        let prev_idx = self.active_tile_idx;
+        if !self.activate_idx(idx) {
+            return false;
+        }
+
+        self.start_tab_switch_animation(prev_idx);
+        true
+    }
+
+    fn start_tab_switch_animation(&mut self, prev_idx: usize) {
+        if self.display_mode != ColumnDisplay::Tabbed
+            || prev_idx == self.active_tile_idx
+            || prev_idx >= self.tiles.len()
+        {
+            return;
+        }
+
+        let direction = if self.active_tile_idx > prev_idx {
+            1.
+        } else {
+            -1.
+        };
+        let config = self.options.animations.window_movement.0;
+        let anim = Animation::new(
+            self.clock.clone(),
+            0.,
+            1.,
+            0.,
+            niri_config::Animation {
+                off: false,
+                kind: niri_config::animations::Kind::Easing(
+                    niri_config::animations::EasingParams {
+                        duration_ms: 5000,
+                        curve: niri_config::animations::Curve::Linear,
+                    },
+                ),
+            },
+        );
+        self.tab_switch_animation = Some(TabSwitchAnimation {
+            anim,
+            from: self.tiles[prev_idx].window().id().clone(),
+            direction,
+        });
+    }
+
+    fn tab_switch_offsets(&self) -> Option<TabSwitchOffsets> {
+        let tab_switch = self.tab_switch_animation.as_ref()?;
+        if self.display_mode != ColumnDisplay::Tabbed {
+            return None;
+        }
+
+        // The tile sliding out may have been closed in the meantime.
+        let from_idx = self.position(&tab_switch.from)?;
+        if from_idx == self.active_tile_idx {
+            return None;
+        }
+
+        let height = f64::max(
+            self.data[self.active_tile_idx].size.h,
+            self.data[from_idx].size.h,
+        );
+        let distance = height + self.options.layout.gaps;
+        let progress = tab_switch.anim.value();
+
+        Some(TabSwitchOffsets {
+            from_idx,
+            active_dy: tab_switch.direction * (1. - progress) * distance,
+            from_dy: -tab_switch.direction * progress * distance,
+            height,
+        })
+    }
+
     fn activate_window(&mut self, window: &W::Id) {
         let idx = self.position(window).unwrap();
-        self.activate_idx(idx);
+        self.switch_to_idx(idx);
     }
 
     fn add_tile_at(&mut self, idx: usize, mut tile: Tile<W>) {
@@ -4859,23 +5008,23 @@ impl<W: LayoutElement> Column<W> {
 
     fn focus_index(&mut self, index: u8) {
         let idx = min(usize::from(index.saturating_sub(1)), self.tiles.len() - 1);
-        self.activate_idx(idx);
+        self.switch_to_idx(idx);
     }
 
     fn focus_up(&mut self) -> bool {
-        self.activate_idx(self.active_tile_idx.saturating_sub(1))
+        self.switch_to_idx(self.active_tile_idx.saturating_sub(1))
     }
 
     fn focus_down(&mut self) -> bool {
-        self.activate_idx(min(self.active_tile_idx + 1, self.tiles.len() - 1))
+        self.switch_to_idx(min(self.active_tile_idx + 1, self.tiles.len() - 1))
     }
 
     fn focus_top(&mut self) {
-        self.activate_idx(0);
+        self.switch_to_idx(0);
     }
 
     fn focus_bottom(&mut self) {
-        self.activate_idx(self.tiles.len() - 1);
+        self.switch_to_idx(self.tiles.len() - 1);
     }
 
     fn move_up(&mut self) -> bool {
@@ -5244,6 +5393,8 @@ impl<W: LayoutElement> Column<W> {
             return;
         }
 
+        self.tab_switch_animation = None;
+
         // Animate the movement.
         //
         // We're doing some shortcuts here because we know that currently normal vs. tabbed can
@@ -5382,11 +5533,29 @@ impl<W: LayoutElement> Column<W> {
         data: impl Iterator<Item = TileData>,
     ) -> impl Iterator<Item = Point<f64, Logical>> {
         let active_idx = self.active_tile_idx;
-        let active_pos = self.tile_offset(active_idx);
+        let tab_switch = self.tab_switch_offsets();
+
+        let mut active_pos = self.tile_offset(active_idx);
+        if let Some(tab_switch) = tab_switch {
+            active_pos.y += tab_switch.active_dy;
+        }
+
         let offsets = self
             .tile_offsets_iter(data)
             .enumerate()
-            .filter_map(move |(idx, pos)| (idx != active_idx).then_some(pos));
+            .filter_map(move |(idx, mut pos)| {
+                if idx == active_idx {
+                    return None;
+                }
+
+                if let Some(tab_switch) = tab_switch {
+                    if idx == tab_switch.from_idx {
+                        pos.y += tab_switch.from_dy;
+                    }
+                }
+
+                Some(pos)
+            });
         iter::once(active_pos).chain(offsets)
     }
 
