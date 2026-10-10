@@ -97,7 +97,7 @@ wayland-scanner = "0.31.11"
 wayland-server = "0.31.14"
 xcursor = "0.3.11"
 zbus = { version = "5", optional = true }
-reis = { version = "0.7", features = ["calloop"], optional = true }
+reis = { version = "0.7", optional = true }
 
 [dependencies.smithay]
 workspace = true
@@ -139,7 +139,7 @@ systemd = ["dbus"]
 # Enables screencasting support through xdg-desktop-portal-gnome.
 xdp-gnome-screencast = ["dbus", "pipewire"]
 # Enables Remote Desktop portal support through xdg-desktop-portal-gnome.
-xdp-gnome-remote-desktop = ["dbus", "reis"]
+xdp-gnome-remote-desktop = ["dbus", "dep:reis", "smithay/backend_libei"]
 # Enables the Tracy profiler instrumentation.
 profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default", "smithay/tracy_gpu_profiling"]
 # Enables the on-demand Tracy profiler instrumentation.

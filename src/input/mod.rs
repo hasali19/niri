@@ -63,7 +63,7 @@ pub mod backend_ext;
 pub mod click_grab;
 #[cfg(feature = "xdp-gnome-remote-desktop")]
 pub mod dbus_remote_desktop_backend;
-#[cfg(feature = "reis")]
+#[cfg(feature = "xdp-gnome-remote-desktop")]
 pub mod eis_backend;
 pub mod move_grab;
 pub mod pick_color_grab;
@@ -4561,6 +4561,12 @@ impl State {
         evt: &impl AbsolutePositionEvent<I>,
         fallback_output: Option<&Output>,
     ) -> Option<Point<f64, Logical>> {
+        // Devices that report positions in the global logical coordinate space bypass the
+        // per-output mapping below. Their origin has to be added back manually.
+        if let Some(origin) = evt.device().absolute_position_origin(self) {
+            return Some(Point::from((evt.x() + origin.x, evt.y() + origin.y)));
+        }
+
         let output = evt.device().output(self);
         let output = output.filter(|output| self.niri.output_exists(output));
         let output = output.as_ref().or(fallback_output)?;
