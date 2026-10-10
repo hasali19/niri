@@ -63,8 +63,6 @@ pub mod backend_ext;
 pub mod click_grab;
 #[cfg(feature = "xdp-gnome-remote-desktop")]
 pub mod dbus_remote_desktop_backend;
-#[cfg(feature = "xdp-gnome-remote-desktop")]
-pub mod eis_backend;
 pub mod move_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
@@ -329,8 +327,12 @@ impl State {
 
     /// Updates the Wayland devices (e.g. `wl_touch`) for necessary capabilities.
     pub fn refresh_wayland_device_caps(&mut self) {
-        let touch_cap_needed =
-            !self.niri.touch.is_empty() || self.niri.remote_desktop.needs_touch_cap();
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let remote_desktop_needs_touch = self.niri.remote_desktop.needs_touch_cap();
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let remote_desktop_needs_touch = false;
+
+        let touch_cap_needed = !self.niri.touch.is_empty() || remote_desktop_needs_touch;
         if touch_cap_needed {
             if self.niri.seat.get_touch().is_none() {
                 trace!("Adding wl_touch to wl_seat");

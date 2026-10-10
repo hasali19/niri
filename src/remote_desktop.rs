@@ -5,51 +5,24 @@ use std::collections::HashMap;
 
 use calloop::RegistrationToken;
 use enumflags2::BitFlags;
-use reis::calloop::{EisRequestSource, EisRequestSourceEvent};
-use reis::ei::device::DeviceType;
-use reis::ei::keyboard::KeymapType;
-use reis::eis;
-use reis::event::DeviceCapability;
-use reis::request::{Device as EiDevice, EisRequest, Seat as EiSeat};
-use smithay::backend::input::{KeyState, Keycode};
-use smithay::input::keyboard::{xkb, KeymapFile, Keysym, ModifiersState, SerializedMods};
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::backend::input::{InputTime, KeyState, Keycode};
+use smithay::backend::libei::{EiInput, EiInputConnection, EiInputEvent, EiInputSeat, EiRegion};
+use smithay::input::keyboard::{xkb, Keysym, ModifiersState, SerializedMods};
+use smithay::utils::{Point, Rectangle, Size};
 
 use crate::backend::IpcOutputMap;
 use crate::dbus::mutter_remote_desktop::{MutterXdpDeviceType, RemoteDesktopDBusToCalloop};
 use crate::input::dbus_remote_desktop_backend::{
     RdEventAdapter, RdInputBackend, RdKeyboardKeyEvent,
 };
-use crate::input::eis_backend::{
-    AbsolutePositionEventExtra, EisEventAdapter, EisInputBackend, PressedCount, ScrollFrame,
-    TouchFrame,
-};
 use crate::niri::State;
 use crate::utils::{global_bounding_rectangle_ipc, RemoteDesktopSessionId};
-
-/// Processes an input event with the EIS event adapter.
-macro_rules! process_event {
-    ($global_state:expr, $session_id:expr, $inner:expr, $variant:ident) => {{
-        process_event!($global_state, $session_id, $inner, $variant, ())
-    }};
-    ($global_state:expr, $session_id:expr, $inner:expr, $variant:ident, $extra:expr) => {{
-        $global_state.process_input_event(InputEvent::$variant {
-            event: EisEventAdapter {
-                session_id: $session_id,
-                inner: $inner,
-                extra: $extra,
-            },
-        });
-    }};
-}
-
-type InputEvent = smithay::backend::input::InputEvent<EisInputBackend>;
 
 /// Child struct of the global [`State`] struct
 #[derive(Default)]
 pub struct RemoteDesktopState {
     /// Active EI sessions.
-    active_ei_sessions: HashMap<RemoteDesktopSessionId, ConnectionState>,
+    active_ei_sessions: HashMap<RemoteDesktopSessionId, EiSessionState>,
 
     /// Counts the number of remote desktop sessions requiring touch capability on the seat.
     ///
@@ -63,79 +36,65 @@ impl RemoteDesktopState {
             || self
                 .active_ei_sessions
                 .values()
-                .any(|sess| sess.needs_touch_cap())
+                .any(|sess| sess.touch_devices > 0)
     }
 }
 
-/// The state for an EI connection (not the `ei_connection` object but
+/// The state for an EI session (not the `ei_connection` object but
 /// [`Context`](reis::eis::Context)).
-struct ConnectionState {
-    last_capabilities: Option<BitFlags<DeviceCapability, u64>>,
-    ei_connection: Option<reis::request::Connection>,
-    seat: Option<EiSeat>,
-    /// The number of keys pressed on all devices in the seat.
-    key_counter: u32,
+struct EiSessionState {
+    /// The EI seat, available once the client has finished the handshake.
+    seat: Option<EiInputSeat>,
+    /// The device types exposed to the EI client by the portal.
     exposed_device_types: BitFlags<MutterXdpDeviceType>,
-    session_id: RemoteDesktopSessionId,
-    /// A scroll frame being filled in by the different scroll events. Assumes there is only
-    /// one device that can emit scroll levents.
-    scroll_frame: Option<ScrollFrame>,
-    /// Whether to send a [`smithay::backend::input::TouchFrameEvent`] when an EIS frame
-    /// request is received.
-    next_frame_touch: bool,
-
-    // Stored for e.g. reload integration
-    keyboard_device: Option<EiDevice>,
-    mouse_device: Option<EiDevice>,
-    touch_device: Option<EiDevice>,
-
+    /// The number of EI touch devices created for this session.
+    touch_devices: usize,
     event_loop_token: RegistrationToken,
 }
-impl ConnectionState {
-    /// Whether this session requires touch capabilities on the seat.
-    fn needs_touch_cap(&self) -> bool {
-        self.touch_device.is_some()
-    }
 
-    /// Returns the rectangle that covers all [EI regions](reis::event::Region) advertised to the EI
-    /// client.
-    ///
-    /// Ignores location as we offset it to 0 in [`advertise_regions`].
-    fn regions_extent(&self, backend: &crate::backend::Backend) -> Option<Rectangle<f64, Logical>> {
-        let ipc_outputs = backend.ipc_outputs();
-        let ipc_outputs = ipc_outputs.lock().unwrap();
+/// Returns the [EI regions](EiRegion) to advertise for the current outputs.
+fn ei_regions(ipc_outputs: &IpcOutputMap) -> Vec<EiRegion> {
+    let Some(bounding_rect) = global_bounding_rectangle_ipc(ipc_outputs) else {
+        return Vec::new();
+    };
 
-        let global_extent = global_bounding_rectangle_ipc(&ipc_outputs)?;
+    ipc_outputs
+        .values()
+        .filter_map(|output| {
+            let logical = output.logical?;
 
-        Some(Rectangle::new(
-            // EI doesn't allow negative positions so this is offset to 0 when advertising
-            // `ei_region`s.
-            Point::default(),
-            Size::new(global_extent.size.w as f64, global_extent.size.h as f64),
-        ))
-    }
+            Some(EiRegion {
+                // EI doesn't allow negative positions, so the regions are offset by the
+                // bounding rectangle origin. Absolute positions get the origin added back
+                // in `NiriInputDevice::absolute_position_origin`.
+                rect: Rectangle::new(
+                    Point::from((
+                        logical.x - bounding_rect.loc.x,
+                        logical.y - bounding_rect.loc.y,
+                    )),
+                    Size::from((logical.width as i32, logical.height as i32)),
+                ),
+                scale: logical.scale as f32,
+                mapping_id: Some(output.name.clone()),
+            })
+        })
+        .collect()
 }
 
 impl State {
     pub fn on_ipc_outputs_changed_remote_desktop(&mut self) {
-        // recreate EI devices
-        let cloned: Vec<_> = self
-            .niri
-            .remote_desktop
-            .active_ei_sessions
-            .values()
-            .filter_map(|sess| {
-                Some((
-                    sess.session_id,
-                    sess.ei_connection.clone()?,
-                    sess.seat.clone()?,
-                    sess.last_capabilities?,
-                ))
-            })
-            .collect();
+        let regions = {
+            let ipc_outputs = self.backend.ipc_outputs();
+            let ipc_outputs = ipc_outputs.lock().unwrap();
+            ei_regions(&ipc_outputs)
+        };
 
-        for (session_id, ei_conn, seat, last_caps) in cloned {
-            create_ei_devices(&ei_conn, self, session_id, seat, last_caps);
+        // Update the advertised regions on all EI seats. Smithay recreates the affected
+        // absolute pointer and touch devices internally.
+        for sess in self.niri.remote_desktop.active_ei_sessions.values() {
+            if let Some(seat) = &sess.seat {
+                seat.update_regions(&regions);
+            }
         }
     }
 
@@ -149,11 +108,10 @@ impl State {
                     .remove(&session_id)
                 {
                     self.niri.event_loop.remove(sess.event_loop_token);
+                    self.refresh_wayland_device_caps();
                 } else {
-                    warn!(
-                        "RemoteDesktop RemoveEisHandler: Invalid session ID {}",
-                        session_id
-                    )
+                    // Normal when the EI client disconnected first.
+                    debug!("RemoteDesktop RemoveEisHandler: no session {}", session_id);
                 }
             }
             RemoteDesktopDBusToCalloop::NewEisContext {
@@ -170,77 +128,8 @@ impl State {
                 state,
                 session_id,
                 time,
-            } => {
-                let keysym = Keysym::from(keysym);
+            } => self.emulate_keysym(keysym, state, session_id, time),
 
-                let keyboard_handle = self.niri.seat.get_keyboard().unwrap();
-
-                let prev_mods_state = keyboard_handle.modifier_state();
-
-                let Some((keycode, mod_mask, mods_state)) =
-                    keyboard_handle.with_xkb_state(self, |context| {
-                        let xkb = context.xkb().lock().unwrap();
-
-                        // SAFETY: the state's ref count isn't increased
-                        let xkb_state = unsafe { xkb.state() };
-
-                        // SAFETY: the keymap's ref count isn't increased
-                        let keymap = unsafe { xkb.keymap() };
-
-                        let (keycode, mod_mask) = keysym_to_keycode(xkb_state, keymap, keysym)?;
-
-                        let mut new_serialized = prev_mods_state.serialized;
-                        match state {
-                            KeyState::Pressed => new_serialized.depressed |= mod_mask,
-                            KeyState::Released => new_serialized.depressed &= !mod_mask,
-                        }
-
-                        // Turn into `ModifiersState`
-                        let mods_state = deserialize_mods(new_serialized, keymap);
-
-                        Some((keycode, mod_mask, mods_state))
-                    })
-                else {
-                    // TODO: update when multi keyboard layouts/groups is supported in search
-                    warn!(
-                        "Couldn't find keycode for keysym {} (raw {}) in the current keyboard layout",
-                        keysym.name().unwrap_or_default(),
-                        keysym.raw()
-                    );
-                    return;
-                };
-
-                debug!(
-                    "{} Emulating keysym={:12} X11 keycode={: <3} depressed={:#04b}, latched={:#04b}, locked={:#04b}, mod_mask={mod_mask:#04b}, prev mod mask={:#04b}",
-                    match state {
-                        KeyState::Pressed => "╭",
-                        KeyState::Released => "╰"
-                    },
-                    keysym.name().unwrap_or_default(), // Used only for debug
-                    keycode.raw(),
-                    mods_state.serialized.depressed,
-                    mods_state.serialized.latched,
-                    mods_state.serialized.locked,
-                    prev_mods_state.serialized.depressed
-                      | prev_mods_state.serialized.latched
-                      | prev_mods_state.serialized.locked,
-                );
-
-                let modifiers_changed = keyboard_handle.set_modifier_state(mods_state);
-                if modifiers_changed != 0 {
-                    keyboard_handle.advertise_modifier_state(self);
-                }
-
-                self.process_input_event::<RdInputBackend>(
-                    smithay::backend::input::InputEvent::Keyboard {
-                        event: RdEventAdapter {
-                            session_id,
-                            time,
-                            inner: RdKeyboardKeyEvent { keycode, state },
-                        },
-                    },
-                );
-            }
             RemoteDesktopDBusToCalloop::IncTouchSession => {
                 self.niri.remote_desktop.dbus_touch_session_counter += 1;
 
@@ -258,58 +147,101 @@ impl State {
         }
     }
 
+    /// Emulates a keysym by looking up a keycode and modifiers in the current keymap.
+    pub fn emulate_keysym(
+        &mut self,
+        keysym: u32,
+        state: KeyState,
+        session_id: RemoteDesktopSessionId,
+        time: InputTime,
+    ) {
+        let keysym = Keysym::from(keysym);
+
+        let keyboard_handle = self.niri.seat.get_keyboard().unwrap();
+
+        let prev_mods_state = keyboard_handle.modifier_state();
+
+        let Some((keycode, mod_mask, mods_state)) =
+            keyboard_handle.with_xkb_state(self, |context| {
+                let xkb = context.xkb().lock().unwrap();
+
+                // SAFETY: the state's ref count isn't increased
+                let xkb_state = unsafe { xkb.state() };
+
+                // SAFETY: the keymap's ref count isn't increased
+                let keymap = unsafe { xkb.keymap() };
+
+                let (keycode, mod_mask) = keysym_to_keycode(xkb_state, keymap, keysym)?;
+
+                let mut new_serialized = prev_mods_state.serialized;
+                match state {
+                    KeyState::Pressed => new_serialized.depressed |= mod_mask,
+                    KeyState::Released => new_serialized.depressed &= !mod_mask,
+                }
+
+                // Turn into `ModifiersState`
+                let mods_state = deserialize_mods(new_serialized, keymap);
+
+                Some((keycode, mod_mask, mods_state))
+            })
+        else {
+            // TODO: update when multi keyboard layouts/groups is supported in search
+            warn!(
+                "Couldn't find keycode for keysym {} (raw {}) in the current keyboard layout",
+                keysym.name().unwrap_or_default(),
+                keysym.raw()
+            );
+            return;
+        };
+
+        debug!(
+            "{} Emulating keysym={:12} X11 keycode={: <3} depressed={:#04b}, latched={:#04b}, locked={:#04b}, mod_mask={mod_mask:#04b}, prev mod mask={:#04b}",
+            match state {
+                KeyState::Pressed => "╭",
+                KeyState::Released => "╰"
+            },
+            keysym.name().unwrap_or_default(), // Used only for debug
+            keycode.raw(),
+            mods_state.serialized.depressed,
+            mods_state.serialized.latched,
+            mods_state.serialized.locked,
+            prev_mods_state.serialized.depressed
+              | prev_mods_state.serialized.latched
+              | prev_mods_state.serialized.locked,
+        );
+
+        let modifiers_changed = keyboard_handle.set_modifier_state(mods_state);
+        if modifiers_changed != 0 {
+            keyboard_handle.advertise_modifier_state(self);
+        }
+
+        self.process_input_event::<RdInputBackend>(smithay::backend::input::InputEvent::Keyboard {
+            event: RdEventAdapter {
+                session_id,
+                time,
+                inner: RdKeyboardKeyEvent { keycode, state },
+            },
+        });
+    }
+
     fn create_new_eis_context(
         &mut self,
         session_id: RemoteDesktopSessionId,
-        ctx: eis::Context,
+        ctx: reis::eis::Context,
         exposed_device_types: BitFlags<MutterXdpDeviceType, u32>,
     ) {
         let event_loop_token = self
             .niri
             .event_loop
-            .insert_source(
-                EisRequestSource::new(ctx, 1),
-                move |event, connection, state| {
-                    let mut post_action =
-                        handle_eis_request_source_event(event, connection, state, session_id);
-                    if post_action != calloop::PostAction::Continue {
-                        debug!("EIS connection {post_action:?}");
-                    }
-                    if let Err(err) = connection.flush() {
-                        warn!("Error while flushing connection: {err}");
-                        post_action = calloop::PostAction::Remove
-                    }
-
-                    if matches!(
-                        post_action,
-                        calloop::PostAction::Remove | calloop::PostAction::Disable
-                    ) {
-                        state
-                            .niri
-                            .remote_desktop
-                            .active_ei_sessions
-                            .remove(&session_id);
-                    }
-
-                    // Always Ok because we never want to propagate the error
-                    // out of the entire event loop
-                    Ok(post_action)
-                },
-            )
+            .insert_source(EiInput::new(ctx), move |event, connection, state| {
+                handle_ei_input_event(state, session_id, event, connection);
+            })
             .unwrap();
 
-        let conn_state = ConnectionState {
-            last_capabilities: None,
-            ei_connection: None,
+        let conn_state = EiSessionState {
             seat: None,
-            key_counter: 0,
             exposed_device_types,
-            session_id,
-            scroll_frame: None,
-            next_frame_touch: false,
-            keyboard_device: None,
-            mouse_device: None,
-            touch_device: None,
+            touch_devices: 0,
             event_loop_token,
         };
 
@@ -320,447 +252,112 @@ impl State {
     }
 }
 
-fn handle_eis_request_source_event(
-    event: Result<EisRequestSourceEvent, reis::Error>,
-    connection: &mut reis::request::Connection,
+fn handle_ei_input_event(
     global_state: &mut State,
     session_id: RemoteDesktopSessionId,
-) -> calloop::PostAction {
-    match event {
-        Ok(event) => match event {
-            EisRequestSourceEvent::Connected => {
-                debug!("EIS connected!");
-                if !connection.has_interface("ei_seat") || !connection.has_interface("ei_device") {
-                    connection.disconnected(
-                        eis::connection::DisconnectReason::Protocol,
-                        Some("Need `ei_seat` and `ei_device`"),
-                    );
-                    return calloop::PostAction::Remove;
-                }
-
-                let conn_state: &mut ConnectionState = global_state
-                    .niri
-                    .remote_desktop
-                    .active_ei_sessions
-                    .get_mut(&session_id)
-                    .expect("remote desktop session being processed should exist");
-
-                let seat = connection.add_seat(
-                    Some("default"),
-                    MutterXdpDeviceType::to_reis_capabilities(conn_state.exposed_device_types),
-                );
-
-                conn_state.seat = Some(seat);
-
-                calloop::PostAction::Continue
-            }
-            EisRequestSourceEvent::Request(request) => {
-                debug!("EIS request! {:#?}", request);
-                handle_eis_request(request, connection, global_state, session_id)
-            }
-        },
-        Err(err) => {
-            warn!("EIS protocol error: {err}");
-            connection.disconnected(
-                eis::connection::DisconnectReason::Protocol,
-                Some(&err.to_string()),
-            );
-            calloop::PostAction::Remove
-        }
-    }
-}
-
-// TODO: send ei_keyboard.modifiers when other keyboards change modifier state?
-// TODO: recreate keyboard with new keymaps
-// ^ Waiting for https://github.com/Smithay/smithay/issues/1776
-
-/// Creates an EI keyboard if the capabilities match.
-///
-/// The device must be [`EiDevice::resumed`] for clients to request to
-/// [`EisRequest::DeviceStartEmulating`] input.
-fn create_ei_keyboard(
-    seat: &EiSeat,
-    capabilities: BitFlags<DeviceCapability>,
-    connection: &reis::request::Connection,
-    global_state: &mut State,
-) -> Option<EiDevice> {
-    (capabilities.contains(DeviceCapability::Keyboard) && connection.has_interface("ei_keyboard"))
-        .then(|| {
-            seat.add_device(
-                Some("keyboard"),
-                DeviceType::Virtual,
-                DeviceCapability::Keyboard.into(),
-                |device| {
-                    let keyboard: reis::eis::Keyboard = device
-                        .interface()
-                        .expect("Should exist because it was just defined");
-
-                    let file = global_state
-                        .niri
-                        .seat
-                        .get_keyboard()
-                        .unwrap()
-                        .with_xkb_state(global_state, |context| {
-                            let xkb = context.xkb().lock().unwrap();
-
-                            // SAFETY: the keymap's ref count isn't increased
-                            let keymap = unsafe { xkb.keymap() };
-                            KeymapFile::new(keymap)
-                        });
-
-                    // > The fd must be mapped with MAP_PRIVATE by the recipient, as MAP_SHARED may fail.
-                    //
-                    // EI protocol allows us to use anonymous, sealed files.
-                    file.with_fd(true, |fd, size| {
-                        // Smithay also does this cast
-                        keyboard.keymap(KeymapType::Xkb, size as u32, fd);
-                    })
-                    .unwrap();
-                    debug!("Sent keymap file");
-
-                    let ipc_outputs = global_state.backend.ipc_outputs();
-                    let ipc_outputs = ipc_outputs.lock().unwrap();
-                    advertise_regions(device, &ipc_outputs);
-                },
-            )
-        })
-}
-
-/// Creates an EI mouse if the capabilities match.
-///
-/// The device must be [`EiDevice::resumed`] for clients to request to
-/// [`EisRequest::DeviceStartEmulating`] input.
-fn create_ei_mouse(
-    seat: &EiSeat,
-    capabilities: BitFlags<DeviceCapability>,
-    connection: &reis::request::Connection,
-    ipc_outputs: &IpcOutputMap,
-) -> Option<EiDevice> {
-    let mut mouse_capabilities = BitFlags::empty();
-
-    let mut check_mouse_cap = |capability, interface| {
-        // We check for the interfaces' existence because the client may send
-        // a 0xffffffffffffffff and then any events we send to the sub-interfaces will be
-        // protocol violations.
-        if capabilities.contains(capability) && connection.has_interface(interface) {
-            mouse_capabilities |= capability;
-        }
-    };
-
-    check_mouse_cap(DeviceCapability::Pointer, "ei_pointer");
-    check_mouse_cap(DeviceCapability::Scroll, "ei_scroll");
-    check_mouse_cap(DeviceCapability::Button, "ei_button");
-    check_mouse_cap(DeviceCapability::PointerAbsolute, "ei_pointer_absolute");
-
-    (!mouse_capabilities.is_empty()).then(|| {
-        seat.add_device(
-            Some("mouse"),
-            DeviceType::Virtual,
-            mouse_capabilities,
-            |device| {
-                advertise_regions(device, ipc_outputs);
-            },
-        )
-    })
-}
-
-/// Creates an EI keyboard if the capabilities match.
-///
-/// The device must be [`EiDevice::resumed`] for clients to request to
-/// [`EisRequest::DeviceStartEmulating`] input.
-fn create_ei_touchscreen(
-    seat: &EiSeat,
-    capabilities: BitFlags<DeviceCapability>,
-    connection: &reis::request::Connection,
-    ipc_outputs: &IpcOutputMap,
-) -> Option<EiDevice> {
-    (capabilities.contains(DeviceCapability::Touch) && connection.has_interface("ei_touchscreen"))
-        .then(|| {
-            seat.add_device(
-                Some("touchscreen"),
-                DeviceType::Virtual,
-                DeviceCapability::Touch.into(),
-                |device| {
-                    advertise_regions(device, ipc_outputs);
-                },
-            )
-        })
-}
-
-/// (Re)creates EI devices.
-fn create_ei_devices(
-    connection: &reis::request::Connection,
-    global_state: &mut State,
-    session_id: RemoteDesktopSessionId,
-    seat: EiSeat,
-    capabilities: BitFlags<DeviceCapability, u64>,
+    event: EiInputEvent,
+    connection: &mut EiInputConnection,
 ) {
-    macro_rules! get_conn_state {
-        // global_state is explicitly specified as a reminder for the lifetime stuff.
-        ($global_state: ident) => {
-            $global_state
+    match event {
+        EiInputEvent::Connected => {
+            debug!("EIS connected!");
+
+            let exposed_device_types = global_state
                 .niri
                 .remote_desktop
                 .active_ei_sessions
-                .get_mut(&session_id)
+                .get(&session_id)
                 .expect("remote desktop session being processed should exist")
-        };
-    }
+                .exposed_device_types;
 
-    {
-        let conn_state = get_conn_state!(global_state);
-
-        // Remove "old" devices
-        for old_device_slot in [
-            &mut conn_state.keyboard_device,
-            &mut conn_state.mouse_device,
-            &mut conn_state.touch_device,
-        ]
-        .into_iter()
-        {
-            if let Some(old_device) = old_device_slot {
-                old_device.remove();
-                *old_device_slot = None;
-            }
-        }
-    }
-
-    // This is funnily separated like this because of the mutable aliasing of conn_state and
-    // global_state
-    let keyboard_device = create_ei_keyboard(&seat, capabilities, connection, global_state);
-
-    {
-        let conn_state = get_conn_state!(global_state);
-
-        let ipc_outputs = global_state.backend.ipc_outputs();
-        let ipc_outputs = ipc_outputs.lock().unwrap();
-
-        if let Some(device) = keyboard_device {
-            device.resumed();
-            conn_state.keyboard_device = Some(device);
-        }
-
-        if let Some(device) = create_ei_mouse(&seat, capabilities, connection, &ipc_outputs) {
-            device.resumed();
-            conn_state.mouse_device = Some(device);
-        }
-
-        if let Some(device) = create_ei_touchscreen(&seat, capabilities, connection, &ipc_outputs) {
-            device.resumed();
-            conn_state.touch_device = Some(device);
-        }
-    }
-
-    // Update the Wayland devices based on the stored data
-    global_state.refresh_wayland_device_caps();
-}
-
-/// Advertises regions on EI devices.
-fn advertise_regions(device: &EiDevice, ipc_outputs: &IpcOutputMap) {
-    let Some(bounding_rect) = global_bounding_rectangle_ipc(ipc_outputs) else {
-        return;
-    };
-
-    for output in ipc_outputs.values() {
-        let Some(l) = output.logical else { continue };
-
-        device.device().region_mapping_id(&output.name);
-
-        device.device().region(
-            // EI doesn't allow negative positions
-            (l.x - bounding_rect.loc.x) as u32,
-            (l.y - bounding_rect.loc.y) as u32,
-            l.width,
-            l.height,
-            l.scale as f32,
-        );
-    }
-}
-
-fn handle_eis_request(
-    request: reis::request::EisRequest,
-    connection: &mut reis::request::Connection,
-    global_state: &mut State,
-    session_id: RemoteDesktopSessionId,
-) -> calloop::PostAction {
-    macro_rules! get_conn_state {
-        // global_state is explicitly specified as a reminder for the lifetime stuff.
-        ($global_state: ident) => {
-            $global_state
-                .niri
-                .remote_desktop
-                .active_ei_sessions
-                .get_mut(&session_id)
-                .expect("remote desktop session being processed should exist")
-        };
-    }
-
-    match request {
-        EisRequest::Disconnect => {
-            return calloop::PostAction::Remove;
-        }
-        EisRequest::Bind(reis::request::Bind { seat, capabilities }) => {
-            let conn_state = get_conn_state!(global_state);
-            if capabilities
-                & MutterXdpDeviceType::to_reis_capabilities(conn_state.exposed_device_types)
-                != capabilities
-            {
-                connection.disconnected(
-                    eis::connection::DisconnectReason::Value,
-                    Some("Binding to invalid capabilities"),
-                );
-                return calloop::PostAction::Remove;
-            }
-
-            conn_state.ei_connection = Some(connection.clone());
-            conn_state.last_capabilities = Some(capabilities);
-
-            // TODO: Why not combine everything into a single device?
-
-            create_ei_devices(connection, global_state, session_id, seat, capabilities);
-        }
-
-        // TODO: what are these?
-        EisRequest::DeviceClosed(_) => {}
-        EisRequest::RequestDevice(_) => {}
-        EisRequest::Ready(_) => {}
-
-        // TODO: implement
-        EisRequest::TextKeysym(_) => {}
-        EisRequest::TextUtf8(_) => {}
-
-        EisRequest::DeviceStartEmulating(_inner) => {}
-        EisRequest::DeviceStopEmulating(_inner) => {}
-
-        EisRequest::PointerMotion(inner) => {
-            process_event!(global_state, session_id, inner, PointerMotion)
-        }
-
-        EisRequest::PointerMotionAbsolute(inner) => {
-            if let Some(regions_extent) =
-                get_conn_state!(global_state).regions_extent(&global_state.backend)
-            {
-                process_event!(
-                    global_state,
-                    session_id,
-                    inner,
-                    PointerMotionAbsolute,
-                    AbsolutePositionEventExtra { regions_extent }
-                )
+            let regions = {
+                let ipc_outputs = global_state.backend.ipc_outputs();
+                let ipc_outputs = ipc_outputs.lock().unwrap();
+                ei_regions(&ipc_outputs)
             };
-        }
 
-        EisRequest::Button(inner) => {
-            process_event!(global_state, session_id, inner, PointerButton)
-        }
+            let seat = connection.add_seat("default");
 
-        EisRequest::ScrollDelta(inner) => {
-            let scroll_frame = get_conn_state!(global_state)
-                .scroll_frame
-                .get_or_insert_default();
-            scroll_frame.delta = Some((inner.dx, inner.dy));
-        }
-
-        EisRequest::ScrollStop(inner) => {
-            let scroll_frame = get_conn_state!(global_state)
-                .scroll_frame
-                .get_or_insert_default();
-            scroll_frame.stop = Some(((inner.x, inner.y), false));
-        }
-
-        EisRequest::ScrollCancel(inner) => {
-            let scroll_frame = get_conn_state!(global_state)
-                .scroll_frame
-                .get_or_insert_default();
-            scroll_frame.stop = Some(((inner.x, inner.y), true));
-        }
-
-        EisRequest::ScrollDiscrete(inner) => {
-            let scroll_frame = get_conn_state!(global_state)
-                .scroll_frame
-                .get_or_insert_default();
-            scroll_frame.discrete = Some((inner.discrete_dx, inner.discrete_dy));
-        }
-
-        EisRequest::Frame(inner) => {
-            let conn_state = get_conn_state!(global_state);
-            let next_frame_touch = conn_state.next_frame_touch;
-            conn_state.next_frame_touch = false;
-
-            if let Some(scroll_frame) = conn_state.scroll_frame.take() {
-                process_event!(
-                    global_state,
-                    session_id,
-                    inner.clone(),
-                    PointerAxis,
-                    scroll_frame
-                )
-            }
-
-            if next_frame_touch {
-                process_event!(
-                    global_state,
-                    session_id,
-                    inner.clone(),
-                    TouchFrame,
-                    TouchFrame
-                );
-            }
-        }
-
-        EisRequest::KeyboardKey(inner) => {
-            let conn_state = get_conn_state!(global_state);
-
-            // This is super naive but Smithay's winit and x11 input adapters do this.
-            match inner.state {
-                reis::ei::keyboard::KeyState::Released => {
-                    conn_state.key_counter = conn_state.key_counter.saturating_sub(1)
+            if exposed_device_types.contains(MutterXdpDeviceType::Keyboard) {
+                let config = global_state.niri.config.borrow();
+                let xkb = config.input.keyboard.xkb.to_xkb_config();
+                if let Err(err) = seat.add_keyboard("keyboard", xkb) {
+                    warn!("error adding EI keyboard: {err:?}");
                 }
-                reis::ei::keyboard::KeyState::Press => conn_state.key_counter += 1,
-            }
-            let pressed_count = PressedCount(conn_state.key_counter);
+                // TODO: do we need to call EiInputEvent::keyboard_modifiers()?
 
-            process_event!(global_state, session_id, inner, Keyboard, pressed_count);
-        }
-
-        EisRequest::TouchDown(inner) => {
-            let conn_state = get_conn_state!(global_state);
-            if let Some(regions_extent) = conn_state.regions_extent(&global_state.backend) {
-                conn_state.next_frame_touch = true;
-                process_event!(
-                    global_state,
-                    session_id,
-                    inner,
-                    TouchDown,
-                    AbsolutePositionEventExtra { regions_extent }
-                );
+                // TODO: implement UTF-8 text input? EiInputSeat::add_text()
             }
-        }
-        EisRequest::TouchMotion(inner) => {
-            let conn_state = get_conn_state!(global_state);
-            if let Some(regions_extent) = conn_state.regions_extent(&global_state.backend) {
-                conn_state.next_frame_touch = true;
 
-                process_event!(
-                    global_state,
-                    session_id,
-                    inner,
-                    TouchMotion,
-                    AbsolutePositionEventExtra { regions_extent }
-                );
+            if exposed_device_types.contains(MutterXdpDeviceType::Pointer) {
+                seat.add_pointer("mouse");
+                seat.add_pointer_absolute("mouse", &regions);
             }
+
+            if exposed_device_types.contains(MutterXdpDeviceType::Touchscreen) {
+                seat.add_touch("touchscreen", &regions);
+            }
+
+            global_state
+                .niri
+                .remote_desktop
+                .active_ei_sessions
+                .get_mut(&session_id)
+                .expect("remote desktop session being processed should exist")
+                .seat = Some(seat);
         }
-        EisRequest::TouchUp(inner) => {
-            process_event!(global_state, session_id, inner, TouchUp);
-            get_conn_state!(global_state).next_frame_touch = true;
+        EiInputEvent::Disconnected => {
+            debug!("EIS disconnected");
+
+            // The EI connection can end independently of the D-Bus session (the client may
+            // just close the socket), so clean up here. If the D-Bus session is dropped
+            // later, its `RemoveEisHandler` will find nothing.
+            //
+            // Note: a client that fails the handshake never emits this event (reis removes
+            // the source silently), so its session entry lingers until the D-Bus session is
+            // dropped. That's harmless because no devices were created so `touch_devices` is 0.
+            global_state
+                .niri
+                .remote_desktop
+                .active_ei_sessions
+                .remove(&session_id);
+            global_state.refresh_wayland_device_caps();
         }
-        EisRequest::TouchCancel(inner) => {
-            process_event!(global_state, session_id, inner, TouchCancel);
-            get_conn_state!(global_state).next_frame_touch = true;
+        EiInputEvent::Event(event) => {
+            let Some(sess) = global_state
+                .niri
+                .remote_desktop
+                .active_ei_sessions
+                .get_mut(&session_id)
+            else {
+                return;
+            };
+
+            match &event {
+                smithay::backend::input::InputEvent::DeviceAdded { device }
+                    if device.has_capability(reis::request::DeviceCapability::Touch) =>
+                {
+                    sess.touch_devices += 1;
+                }
+                smithay::backend::input::InputEvent::DeviceRemoved { device }
+                    if device.has_capability(reis::request::DeviceCapability::Touch) =>
+                {
+                    sess.touch_devices = sess.touch_devices.saturating_sub(1);
+                }
+                _ => (),
+            }
+
+            // This also refreshes the Wayland device capabilities (e.g. wl_touch), which
+            // should happen after updating the touch device count above.
+            global_state.process_input_event(event);
+        }
+        EiInputEvent::TextKeysym { keysym, state } => {
+            global_state.emulate_keysym(keysym, state, session_id, InputTime::now());
+        }
+        EiInputEvent::TextUtf8 { text } => {
+            debug!("ignoring text {text:?} from EI client");
         }
     }
-
-    calloop::PostAction::Continue
 }
 
 /// Reconstructs symbolic meanings of modifiers ([`ModifiersState`]) from serialized modifiers.

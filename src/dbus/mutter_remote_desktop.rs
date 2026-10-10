@@ -12,7 +12,9 @@ use enumflags2::BitFlags;
 use futures_util::lock::Mutex;
 use serde::{Deserialize, Serialize};
 use smithay::backend::input::{AxisSource, InputTime, KeyState, Keycode};
-use smithay::utils::{Logical, Point};
+#[cfg(feature = "xdp-gnome-screencast")]
+use smithay::utils::Logical;
+use smithay::utils::Point;
 #[cfg(feature = "xdp-gnome-screencast")]
 use zbus::object_server::InterfaceRef;
 use zbus::object_server::SignalEmitter;
@@ -25,7 +27,9 @@ use crate::input::dbus_remote_desktop_backend::{
     RdPointerButtonEvent, RdPointerMotionAbsoluteEvent, RdPointerMotionEvent, RdTouchEvent,
     UnitIntervalPointKind,
 };
-use crate::utils::{global_bounding_rectangle_ipc, RemoteDesktopSessionId};
+#[cfg(feature = "xdp-gnome-screencast")]
+use crate::utils::global_bounding_rectangle_ipc;
+use crate::utils::RemoteDesktopSessionId;
 
 #[cfg(feature = "xdp-gnome-screencast")]
 pub(super) mod shared {
@@ -123,6 +127,7 @@ impl RemoteDesktop {
             id: session_id,
             id_str: session_id.to_string(),
             to_calloop: self.to_calloop.clone(),
+            #[cfg(feature = "xdp-gnome-screencast")]
             shared: self.shared.clone(),
             active: false,
             using_eis: false,
@@ -169,6 +174,7 @@ pub(super) struct Session {
     id: RemoteDesktopSessionId,
     id_str: String,
     to_calloop: calloop::channel::Sender<RemoteDesktopDBusToCalloop>,
+    #[cfg(feature = "xdp-gnome-screencast")]
     shared: Arc<Mutex<shared::RemoteDesktopShared>>,
     pub active: bool,
     using_eis: bool,
@@ -222,6 +228,7 @@ impl Session {
     /// the global bounding rectangle.
     ///
     /// - `stream_path`: D-Bus object path like `/org/gnome/Mutter/ScreenCast/Stream/u7`
+    #[cfg(feature = "xdp-gnome-screencast")]
     async fn convert_stream_coordinate_space(
         &self,
         stream_path: &str,
@@ -267,6 +274,20 @@ impl Session {
         let point_unit_interval = Point::new(point_unit_interval.x, point_unit_interval.y);
 
         Ok(point_unit_interval)
+    }
+
+    /// Absolute coordinates can only be mapped through a screencast session, which is
+    /// unavailable if screencast support is disabled at compile time.
+    #[cfg(not(feature = "xdp-gnome-screencast"))]
+    async fn convert_stream_coordinate_space(
+        &self,
+        _stream_path: &str,
+        _x: f64,
+        _y: f64,
+    ) -> fdo::Result<Point<f64, UnitIntervalPointKind>> {
+        Err(fdo::Error::Failed(
+            "Screencast support is disabled at compile time in Niri".to_owned(),
+        ))
     }
 
     /// Stops the session.
@@ -349,28 +370,6 @@ pub enum MutterXdpDeviceType {
     Keyboard = 1,
     Pointer = 1 << 1,
     Touchscreen = 1 << 2,
-}
-
-impl MutterXdpDeviceType {
-    /// To [`reis`] capabilities for exposing only portal-selected device capabilities
-    pub fn to_reis_capabilities(flags: BitFlags<Self>) -> BitFlags<reis::event::DeviceCapability> {
-        use reis::event::DeviceCapability;
-        let mut out_flags = BitFlags::empty();
-        for flag in flags {
-            match flag {
-                // TODO: implement Text capability
-                MutterXdpDeviceType::Keyboard => out_flags |= DeviceCapability::Keyboard,
-                MutterXdpDeviceType::Pointer => {
-                    out_flags |= DeviceCapability::Pointer
-                        | DeviceCapability::Scroll
-                        | DeviceCapability::Button
-                        | DeviceCapability::PointerAbsolute
-                }
-                MutterXdpDeviceType::Touchscreen => out_flags |= DeviceCapability::Touch,
-            }
-        }
-        out_flags
-    }
 }
 
 #[interface(

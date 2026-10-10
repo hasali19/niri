@@ -141,11 +141,13 @@ impl ScreenCast {
 
         match server.at(&path, session).await {
             Ok(true) => {
-                let iface = server.interface(&path).await.unwrap();
-
                 #[cfg(feature = "xdp-gnome-remote-desktop")]
-                if let Some(mut state) = rd_session_state {
-                    state.screen_cast_session = Some((iface.clone(), server.clone()));
+                {
+                    let iface = server.interface(&path).await.unwrap();
+
+                    if let Some(mut state) = rd_session_state {
+                        state.screen_cast_session = Some((iface.clone(), server.clone()));
+                    }
                 }
             }
             Ok(false) => return Err(fdo::Error::Failed("session path already exists".to_owned())),
@@ -396,7 +398,10 @@ impl Session {
         }
 
         // Remove reference to the remote desktop interface so it can be dropped
-        self.rd_session = None;
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        {
+            self.rd_session = None;
+        }
 
         Session::closed(ctxt).await.unwrap();
 
