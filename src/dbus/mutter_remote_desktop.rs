@@ -600,36 +600,42 @@ impl Session {
 
     /// Enables calling *Selection* and DisableClipboard
     async fn enable_clipboard(&mut self, _options: ClipboardOptions) -> fdo::Result<()> {
-        // TODO!
-        Ok(())
+        Err(fdo::Error::NotSupported(
+            "Clipboard is not implemented by Niri".to_owned(),
+        ))
     }
 
-    async fn disable_clipbard(&mut self) -> fdo::Result<()> {
-        // TODO!
-        Ok(())
+    async fn disable_clipboard(&mut self) -> fdo::Result<()> {
+        Err(fdo::Error::NotSupported(
+            "Clipboard is not implemented by Niri".to_owned(),
+        ))
     }
 
     async fn set_selection(&mut self, _options: ClipboardOptions) -> fdo::Result<()> {
-        // TODO!
-        Ok(())
+        Err(fdo::Error::NotSupported(
+            "Clipboard is not implemented by Niri".to_owned(),
+        ))
     }
 
     /// Answer to the [`selection_transfer`] signal
     async fn selection_write(&mut self, _serial: u32) -> fdo::Result<zvariant::OwnedFd> {
-        // TODO!
-        todo!()
+        Err(fdo::Error::NotSupported(
+            "Clipboard is not implemented by Niri".to_owned(),
+        ))
     }
 
     /// Notifies that the transfer of clipboard data through the file descriptor returned in
     /// [`selection_write`] has either completed successfully, or failed
-    async fn selection_write_done(&mut self, _serial: u32, _successs: bool) -> fdo::Result<()> {
-        // TODO!
-        Ok(())
+    async fn selection_write_done(&mut self, _serial: u32, _success: bool) -> fdo::Result<()> {
+        Err(fdo::Error::NotSupported(
+            "Clipboard is not implemented by Niri".to_owned(),
+        ))
     }
 
     async fn selection_read(&mut self, _mime_type: &str) -> fdo::Result<zvariant::OwnedFd> {
-        // TODO!
-        todo!()
+        Err(fdo::Error::NotSupported(
+            "Clipboard is not implemented by Niri".to_owned(),
+        ))
     }
 
     #[zbus(signal)]
