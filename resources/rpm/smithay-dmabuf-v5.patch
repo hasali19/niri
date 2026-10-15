@@ -1,0 +1,15 @@
+Advertise zwp_linux_dmabuf_v1 version 5 instead of 6.
+
+Applied to the smithay git checkout when building the RPM for RHEL.
+
+--- a/src/wayland/dmabuf/mod.rs
++++ b/src/wayland/dmabuf/mod.rs
+@@ -713,7 +713,7 @@
+             );
+ 
+         let formats = Arc::new(formats);
+-        let version = if default_feedback.is_some() { 6 } else { 3 };
++        let version = if default_feedback.is_some() { 5 } else { 3 };
+ 
+         let known_default_feedbacks = Arc::new(Mutex::new(Vec::new()));
+         let default_feedback = default_feedback.map(|f| Arc::new(Mutex::new(f.clone())));
