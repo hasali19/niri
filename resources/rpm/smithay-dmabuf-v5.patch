@@ -1,6 +1,4 @@
-Advertise zwp_linux_dmabuf_v1 version 5 instead of 6.
-
-Applied to the smithay git checkout when building the RPM for RHEL.
+Advertise zwp_linux_dmabuf_v1 version 5 instead of 6 on RHEL 10. This is because RHEL uses a buggy version of GTK4 that incorrectly negotiates the latest version of the protocol even though it only supports 5, causing GTK4 applications to crash.
 
 --- a/src/wayland/dmabuf/mod.rs
 +++ b/src/wayland/dmabuf/mod.rs
