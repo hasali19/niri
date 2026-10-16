@@ -127,8 +127,6 @@ sed -i 's/.*please-remove-me$//' .cargo/config.toml
 sed -i 's/\[env\]/[env]\nNIRI_BUILD_COMMIT="%{version}"/' .cargo/config.toml
 
 %if 0%{?rhel}
-# Advertise zwp_linux_dmabuf_v1 v5 instead of v6 on RHEL. The version is
-# hardcoded in Smithay, so fetch the dependencies and patch the git checkout.
 %{__cargo} fetch --locked
 for dir in .cargo/git/checkouts/smithay-*/*/; do
   patch -p1 -d "$dir" < resources/rpm/smithay-dmabuf-v5.patch
