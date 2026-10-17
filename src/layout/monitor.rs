@@ -7,7 +7,6 @@ use niri_config::{CornerRadius, LayoutPart};
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::Color32F;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -254,6 +253,22 @@ impl WorkspaceSwitchGesture {
     fn animate_from(&mut self, from: f64, clock: Clock, config: niri_config::Animation) {
         let current = self.animation.as_ref().map_or(0., Animation::value);
         self.animation = Some(Animation::new(clock, from + current, 0., 0., config));
+    }
+}
+
+/// Returns a function that places elements of a workspace being dragged in the overview.
+fn dragged_scale_relocate<R: NiriRenderer>(
+    scale: f64,
+    zoom: f64,
+    loc: Point<f64, Logical>,
+) -> impl Fn(MonitorInnerRenderElement<R>) -> MonitorRenderElement<R> {
+    move |elem| {
+        let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
+        RelocateRenderElement::from_element(
+            elem,
+            loc.to_physical_precise_round(scale),
+            Relocate::Relative,
+        )
     }
 }
 
@@ -1100,14 +1115,8 @@ impl<W: LayoutElement> Monitor<W> {
             ws.update_render_elements(is_active, RenderLayer::MovingBetweenWorkspaces);
         }
 
-        let dragged_workspace = self.dragged_workspace;
-
         for (ws, geo) in self.workspaces_with_render_geo_mut(true) {
             ws.update_render_elements(is_active, RenderLayer::Normal);
-
-            if Some(ws.id()) == dragged_workspace {
-                ws.update_placeholder(ws.view_size(), Color32F::from([0.15, 0.15, 0.15, 0.3]));
-            }
 
             if Some(ws.id()) == insert_hint_ws_id {
                 insert_hint_ws_geo = Some(geo);
@@ -1874,17 +1883,10 @@ impl<W: LayoutElement> Monitor<W> {
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
 
-        let loc = location.to_physical_precise_round(scale).to_logical(scale);
+        let loc = self.dragged_workspace_geo(location).loc;
         let xray_pos = XrayPos::new(loc, zoom);
 
-        let scale_relocate = move |elem| {
-            let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
-            RelocateRenderElement::from_element(
-                elem,
-                loc.to_physical_precise_round(scale),
-                Relocate::Relative,
-            )
-        };
+        let scale_relocate = dragged_scale_relocate(scale, zoom, loc);
 
         // Nothing to crop against since the workspace can go anywhere on the output.
         let crop_bounds = Rectangle::new(
@@ -1938,16 +1940,9 @@ impl<W: LayoutElement> Monitor<W> {
             .as_ref()
             .map_or(1., |p| p.clamped_value().clamp(0., 1.)) as f32;
 
-        let loc = location.to_physical_precise_round(scale).to_logical(scale);
+        let loc = self.dragged_workspace_geo(location).loc;
 
-        let scale_relocate = move |elem| {
-            let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
-            RelocateRenderElement::from_element(
-                elem,
-                loc.to_physical_precise_round(scale),
-                Relocate::Relative,
-            )
-        };
+        let scale_relocate = dragged_scale_relocate(scale, zoom, loc);
 
         push(scale_relocate(MonitorInnerRenderElement::SolidColor(
             ws.render_background(),

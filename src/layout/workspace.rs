@@ -9,7 +9,6 @@ use niri_config::{
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::Color32F;
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -273,7 +272,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
-            placeholder_buffer: SolidColorBuffer::default(),
+            placeholder_buffer: SolidColorBuffer::new(view_size, PLACEHOLDER_COLOR),
             output: Some(output),
             clock,
             base_options,
@@ -337,7 +336,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
-            placeholder_buffer: SolidColorBuffer::default(),
+            placeholder_buffer: SolidColorBuffer::new(view_size, PLACEHOLDER_COLOR),
             clock,
             base_options,
             options,
@@ -616,6 +615,7 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         self.background_buffer.resize(size);
+        self.placeholder_buffer.resize(size);
 
         if scale_transform_changed {
             for window in self.windows() {
@@ -1712,10 +1712,6 @@ impl<W: LayoutElement> Workspace<W> {
         self.shadow.render(renderer, Point::from((0., 0.)), push);
     }
 
-    pub fn update_placeholder(&mut self, size: Size<f64, Logical>, color: Color32F) {
-        self.placeholder_buffer.update(size, color);
-    }
-
     pub fn render_placeholder(&self) -> SolidColorRenderElement {
         SolidColorRenderElement::from_buffer(
             &self.placeholder_buffer,
@@ -2122,6 +2118,9 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 }
+
+/// Color of the translucent placeholder left in the slot of a workspace being dragged.
+const PLACEHOLDER_COLOR: [f32; 4] = [0.15, 0.15, 0.15, 0.3];
 
 pub(super) fn compute_working_area(output: &Output) -> Rectangle<f64, Logical> {
     layer_map_for_output(output).non_exclusive_zone().to_f64()

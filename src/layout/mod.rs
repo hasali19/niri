@@ -479,6 +479,27 @@ struct WorkspaceDragRender<'a, W: LayoutElement> {
     location: Point<f64, Logical>,
 }
 
+/// Where a workspace being dragged would be dropped.
+struct WorkspaceDrop {
+    /// Index of the monitor the workspace is currently on.
+    source_idx: usize,
+    /// Index of the monitor the workspace is being dropped on.
+    target_idx: usize,
+    /// Current index of the workspace on its monitor.
+    old_idx: usize,
+    /// Index of the workspace on the target monitor to insert before.
+    slot: usize,
+}
+
+impl WorkspaceDrop {
+    /// Whether dropping the workspace here leaves everything where it is.
+    fn is_noop(&self) -> bool {
+        // Dropping right before or after itself doesn't change anything.
+        self.source_idx == self.target_idx
+            && (self.slot == self.old_idx || self.slot == self.old_idx + 1)
+    }
+}
+
 /// Animation of a dropped workspace settling into its place.
 #[derive(Debug)]
 struct WorkspaceDropAnim {
@@ -2930,24 +2951,17 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
-        let drag_output = self
-            .workspace_drag
-            .as_ref()
-            .map(|drag| &drag.output)
-            .or_else(|| self.workspace_drop_anim.as_ref().map(|a| &a.output))
-            .cloned();
-        if drag_output
-            .as_ref()
-            .is_some_and(|drag_output| output.is_none_or(|output| drag_output == output))
-        {
-            // The dragged workspace may be off-screen or on a different monitor, so update its
-            // elements explicitly.
+        // The dragged workspace may be off-screen or on a different monitor, so update its
+        // elements explicitly.
+        let dragged = self
+            .dragged_workspace()
+            .filter(|&(_, drag_output)| output.is_none_or(|output| drag_output == output))
+            .map(|(ws_id, _)| ws_id);
+        if let Some(ws_id) = dragged {
             let is_active = self.is_active;
-            if let Some(ws_id) = self.dragged_workspace_id() {
-                if let Some(ws) = self.workspaces_mut().find(|ws| ws.id() == ws_id) {
-                    ws.update_render_elements(is_active, RenderLayer::MovingBetweenWorkspaces);
-                    ws.update_render_elements(is_active, RenderLayer::Normal);
-                }
+            if let Some(ws) = self.workspaces_mut().find(|ws| ws.id() == ws_id) {
+                ws.update_render_elements(is_active, RenderLayer::MovingBetweenWorkspaces);
+                ws.update_render_elements(is_active, RenderLayer::Normal);
             }
         }
     }
@@ -2980,25 +2994,10 @@ impl<W: LayoutElement> Layout<W> {
 
         if let Some(drag) = &self.workspace_drag {
             if output.is_none_or(|output| drag.output == *output) {
-                let ws_id = drag.ws_id;
-                let drag_output = drag.output.clone();
-                let pos = drag.pointer_pos_within_output;
-
-                let source = self.workspaces().find_map(|(mon, idx, ws)| {
-                    (ws.id() == ws_id).then(|| (mon.map(|mon| mon.output().clone()), idx))
-                });
-
-                if let Some(mon) = self.monitor_for_output_mut(&drag_output) {
-                    let slot = mon.workspace_drop_slot(pos);
-
-                    // Dropping right before or after itself doesn't change anything.
-                    let is_noop = source.is_some_and(|(output, idx)| {
-                        output.as_ref() == Some(&drag_output) && (slot == idx || slot == idx + 1)
-                    });
-
-                    if !is_noop {
-                        mon.insert_hint = Some(InsertHint {
-                            workspace: InsertWorkspace::NewAt(slot),
+                if let Some(drop) = self.workspace_drop().filter(|drop| !drop.is_noop()) {
+                    if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+                        monitors[drop.target_idx].insert_hint = Some(InsertHint {
+                            workspace: InsertWorkspace::NewAt(drop.slot),
                             position: InsertPosition::NewColumn(0),
                             corner_radius: CornerRadius::default(),
                         });
@@ -4617,8 +4616,33 @@ impl<W: LayoutElement> Layout<W> {
         self.find_workspace_by_id(ws_id).is_some()
     }
 
+    /// Returns where the workspace being dragged would be dropped.
+    fn workspace_drop(&self) -> Option<WorkspaceDrop> {
+        let drag = self.workspace_drag.as_ref()?;
+        let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
+            return None;
+        };
+
+        let target_idx = monitors.iter().position(|mon| mon.output == drag.output)?;
+        let (source_idx, old_idx) = monitors
+            .iter()
+            .enumerate()
+            .find_map(|(idx, mon)| Some((idx, mon.idx_of_ws(drag.ws_id)?)))?;
+        let slot = monitors[target_idx].workspace_drop_slot(drag.pointer_pos_within_output);
+
+        Some(WorkspaceDrop {
+            source_idx,
+            target_idx,
+            old_idx,
+            slot,
+        })
+    }
+
     /// Ends the workspace drag, dropping the workspace at the current position if `apply` is set.
     pub fn workspace_drag_end(&mut self, apply: bool) {
+        // Figure out where to drop before the edge scrolling ends and starts moving the view.
+        let drop = apply.then(|| self.workspace_drop()).flatten();
+
         let Some(drag) = self.workspace_drag.take() else {
             return;
         };
@@ -4626,19 +4650,6 @@ impl<W: LayoutElement> Layout<W> {
         let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
             return;
         };
-
-        // Figure out where to drop before the edge scrolling ends and starts moving the view.
-        let drop = apply
-            .then(|| {
-                let target_idx = monitors.iter().position(|mon| mon.output == drag.output)?;
-                let (source_idx, old_idx) = monitors
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, mon)| Some((idx, mon.idx_of_ws(drag.ws_id)?)))?;
-                let slot = monitors[target_idx].workspace_drop_slot(drag.pointer_pos_within_output);
-                Some((target_idx, source_idx, old_idx, slot))
-            })
-            .flatten();
 
         // Where the workspace was rendered, in the output of the pointer.
         let drag_location = monitors
@@ -4652,25 +4663,29 @@ impl<W: LayoutElement> Layout<W> {
             mon.dnd_scroll_gesture_end();
         }
 
-        if let Some((target_idx, source_idx, old_idx, slot)) = drop {
-            if source_idx == target_idx {
-                // Dropping right before or after itself doesn't change anything.
-                if slot != old_idx && slot != old_idx + 1 {
-                    let new_idx = if slot > old_idx { slot - 1 } else { slot };
-                    monitors[source_idx]
-                        .preserving_view(|mon| mon.move_workspace_to_idx(old_idx, new_idx));
-                }
+        if let Some(drop) = &drop {
+            if drop.is_noop() {
+                // Nothing to reorder.
+            } else if drop.source_idx == drop.target_idx {
+                let new_idx = if drop.slot > drop.old_idx {
+                    drop.slot - 1
+                } else {
+                    drop.slot
+                };
+                monitors[drop.source_idx]
+                    .preserving_view(|mon| mon.move_workspace_to_idx(drop.old_idx, new_idx));
             } else {
-                let mut ws = monitors[source_idx]
-                    .preserving_view(|mon| mon.remove_workspace_by_idx(old_idx));
+                let mut ws = monitors[drop.source_idx]
+                    .preserving_view(|mon| mon.remove_workspace_by_idx(drop.old_idx));
                 ws.original_outputs = vec![OutputId::new(&drag.output)];
-                monitors[target_idx].preserving_view(|mon| mon.insert_workspace(ws, slot, false));
+                monitors[drop.target_idx]
+                    .preserving_view(|mon| mon.insert_workspace(ws, drop.slot, false));
             }
         }
 
         // Center the view on the dropped workspace.
-        if let Some((target_idx, ..)) = drop {
-            let mon = &mut monitors[target_idx];
+        if let Some(drop) = &drop {
+            let mon = &mut monitors[drop.target_idx];
             if let Some(idx) = mon.idx_of_ws(drag.ws_id) {
                 mon.activate_workspace(idx);
             }
@@ -4709,12 +4724,18 @@ impl<W: LayoutElement> Layout<W> {
         });
     }
 
-    /// Returns the workspace that is being dragged or is settling after a drop.
+    /// Returns the workspace that is being dragged or is settling after a drop, and its output.
+    pub fn dragged_workspace(&self) -> Option<(WorkspaceId, &Output)> {
+        if let Some(drag) = &self.workspace_drag {
+            Some((drag.ws_id, &drag.output))
+        } else {
+            let drop = self.workspace_drop_anim.as_ref()?;
+            Some((drop.ws_id, &drop.output))
+        }
+    }
+
     pub fn dragged_workspace_id(&self) -> Option<WorkspaceId> {
-        self.workspace_drag
-            .as_ref()
-            .map(|drag| drag.ws_id)
-            .or_else(|| self.workspace_drop_anim.as_ref().map(|a| a.ws_id))
+        self.dragged_workspace().map(|(ws_id, _)| ws_id)
     }
 
     /// Returns the dragged workspace and where it is being drawn on the output.
@@ -4795,10 +4816,6 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         mon.render_dragged_workspace_background(ws, location, renderer, push);
-    }
-
-    pub fn workspace_drag_id(&self) -> Option<WorkspaceId> {
-        self.workspace_drag.as_ref().map(|drag| drag.ws_id)
     }
 
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {

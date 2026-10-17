@@ -4698,8 +4698,9 @@ impl Niri {
             // The dragged workspace is drawn on top of everything else, with its own copies of the
             // per-workspace layers (wallpaper), and a translucent placeholder is left in its place.
             if let Some((ws_id, geo, bg_color)) = self.layout.workspace_drag_render_info(output) {
-                // Distinct from the namespace of the placeholder's workspace.
-                let ns = Some(ws_id.get() as usize ^ (1 << (usize::BITS - 1)));
+                // The workspace's slot only has the placeholder, so its layer elements don't clash
+                // with the ones below.
+                let ns = Some(ws_id.get() as usize);
                 let xray_pos = XrayPos::new(geo.loc, zoom);
 
                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
