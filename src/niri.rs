@@ -3506,22 +3506,9 @@ impl Niri {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(Output, Point<f64, Logical>, WorkspaceId)> {
-        if self.exit_confirm_dialog.is_open() || self.is_locked() || self.screenshot_ui.is_open() {
-            return None;
-        }
-
-        let (output, pos_within_output) = self.output_under(pos)?;
-
-        if self.is_sticky_obscured_under(output, pos_within_output)
-            || self.is_layout_obscured_under(output, pos_within_output)
-        {
-            return None;
-        }
-
-        let ws_id = self
-            .layout
-            .draggable_workspace_under(output, pos_within_output)?;
-        Some((output.clone(), pos_within_output, ws_id))
+        let (output, ws) = self.workspace_under(true, pos)?;
+        let (_, pos_within_output) = self.output_under(pos)?;
+        Some((output, pos_within_output, ws.id()))
     }
 
     pub fn workspace_under_cursor(

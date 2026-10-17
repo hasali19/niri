@@ -1669,22 +1669,6 @@ impl<W: LayoutElement> Monitor<W> {
         (InsertWorkspace::NewAt(last_idx + 1), dummy)
     }
 
-    /// Returns the workspace that can be dragged in the overview from the position.
-    ///
-    /// Like for the rest of the overview input, the workspace spans the entire output width.
-    pub fn draggable_workspace_under(
-        &self,
-        pos_within_output: Point<f64, Logical>,
-    ) -> Option<&Workspace<W>> {
-        if !self.overview_open || self.overview_progress.is_none() {
-            return None;
-        }
-
-        // Empty workspaces are cleaned up automatically, so there's no point in moving them.
-        let (ws, _geo) = self.workspace_under(pos_within_output)?;
-        ws.has_windows_or_name().then_some(ws)
-    }
-
     /// Returns the index to insert a dragged workspace at, given the pointer position.
     ///
     /// The result is the index of the workspace to insert before. It never goes past the last

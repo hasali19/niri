@@ -4554,30 +4554,20 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    /// Returns the workspace under the specified position.
-    pub fn draggable_workspace_under(
-        &self,
-        output: &Output,
-        pos_within_output: Point<f64, Logical>,
-    ) -> Option<WorkspaceId> {
-        if self.workspace_drag.is_some() || self.interactive_move.is_some() {
-            return None;
-        }
-
-        let mon = self.monitor_for_output(output)?;
-        Some(mon.draggable_workspace_under(pos_within_output)?.id())
-    }
-
     pub fn workspace_drag_begin(
         &mut self,
         ws_id: WorkspaceId,
         output: Output,
         pointer_pos_within_output: Point<f64, Logical>,
     ) -> bool {
-        if !self.overview_open
-            || self.workspace_drag.is_some()
-            || self.interactive_move.is_some()
-            || self.find_workspace_by_id(ws_id).is_none()
+        if !self.overview_open || self.workspace_drag.is_some() || self.interactive_move.is_some() {
+            return false;
+        }
+
+        // Empty workspaces are cleaned up automatically, so there's no point in moving them.
+        if !self
+            .find_workspace_by_id(ws_id)
+            .is_some_and(|(_, ws)| ws.has_windows_or_name())
         {
             return false;
         }
