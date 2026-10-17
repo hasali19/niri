@@ -3384,10 +3384,10 @@ impl Niri {
         Some((output.clone(), ws))
     }
 
-    /// Returns the workspace whose overview drag handle is under the position.
+    /// Returns the workspace under the specified position.
     ///
     /// The return value is an output, the position within it and a workspace id.
-    pub fn workspace_handle_under(
+    pub fn draggable_workspace_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(Output, Point<f64, Logical>, WorkspaceId)> {
@@ -3405,7 +3405,7 @@ impl Niri {
 
         let ws_id = self
             .layout
-            .workspace_handle_under(output, pos_within_output)?;
+            .draggable_workspace_under(output, pos_within_output)?;
         Some((output.clone(), pos_within_output, ws_id))
     }
 
@@ -4595,14 +4595,6 @@ impl Niri {
                 let ns = Some(ws_id.get() as usize ^ (1 << (usize::BITS - 1)));
                 let xray_pos = XrayPos::new(geo.loc, zoom);
 
-                // The handle goes first (on top) so that it doesn't get hidden by the workspace
-                // it is dragged over.
-                self.layout.render_workspace_drag_handle_for_output(
-                    ctx.renderer,
-                    output,
-                    &mut |elem| push(elem.into()),
-                );
-
                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
@@ -4673,7 +4665,6 @@ impl Niri {
             }
         }
 
-        mon.render_workspace_handles(ctx.renderer, &mut |elem| push(elem.into()));
         mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
 
         // Then the backdrop.

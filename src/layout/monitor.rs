@@ -257,38 +257,6 @@ impl WorkspaceSwitchGesture {
     }
 }
 
-/// Returns the drag handle geometry of a workspace in the overview.
-///
-/// The handle sits in the gap above the workspace. The first rectangle is the area that accepts
-/// input, the second is the visible pill.
-fn workspace_handle_geo(
-    ws_geo: Rectangle<f64, Logical>,
-    gap: f64,
-    scale: f64,
-) -> (Rectangle<f64, Logical>, Rectangle<f64, Logical>) {
-    let hit_size = Size::from((ws_geo.size.w * 0.2, gap));
-    let hit_loc = Point::from((
-        ws_geo.loc.x + (ws_geo.size.w - hit_size.w) / 2.,
-        ws_geo.loc.y - gap,
-    ));
-    let hit = Rectangle::new(hit_loc, hit_size);
-
-    let size = Size::from((
-        round_logical_in_physical(scale, hit_size.w * 0.5),
-        round_logical_in_physical(scale, gap * 0.22),
-    ));
-    let loc = Point::from((
-        hit.loc.x + (hit.size.w - size.w) / 2.,
-        // Sit closer to the workspace than the middle of the gap: half of the centered distance.
-        ws_geo.loc.y - size.h - (gap - size.h) / 4.,
-    ));
-    let visible = Rectangle::new(loc, size)
-        .to_physical_precise_round(scale)
-        .to_logical(scale);
-
-    (hit, visible)
-}
-
 impl InsertWorkspace {
     fn existing_id(self) -> Option<WorkspaceId> {
         match self {
@@ -1133,29 +1101,12 @@ impl<W: LayoutElement> Monitor<W> {
         }
 
         let dragged_workspace = self.dragged_workspace;
-        let is_overview = self.overview_progress.is_some();
-        let handle_scale = self.scale.fractional_scale();
-        let handle_gap = self.workspace_gap(self.overview_zoom());
-        let handle_alpha = self
-            .overview_progress
-            .as_ref()
-            .map_or(1., |p| p.clamped_value().clamp(0., 1.)) as f32;
 
         for (ws, geo) in self.workspaces_with_render_geo_mut(true) {
             ws.update_render_elements(is_active, RenderLayer::Normal);
 
             if Some(ws.id()) == dragged_workspace {
                 ws.update_placeholder(ws.view_size(), Color32F::from([0.15, 0.15, 0.15, 0.3]));
-            }
-
-            if is_overview {
-                let (_, handle) = workspace_handle_geo(geo, handle_gap, handle_scale);
-                ws.update_handle(
-                    handle.size,
-                    Some(ws.id()) == dragged_workspace,
-                    handle_scale,
-                    handle_alpha,
-                );
             }
 
             if Some(ws.id()) == insert_hint_ws_id {
@@ -1718,8 +1669,10 @@ impl<W: LayoutElement> Monitor<W> {
         (InsertWorkspace::NewAt(last_idx + 1), dummy)
     }
 
-    /// Returns the workspace whose overview drag handle is under the position.
-    pub fn workspace_handle_under(
+    /// Returns the workspace that can be dragged in the overview from the position.
+    ///
+    /// Like for the rest of the overview input, the workspace spans the entire output width.
+    pub fn draggable_workspace_under(
         &self,
         pos_within_output: Point<f64, Logical>,
     ) -> Option<&Workspace<W>> {
@@ -1727,18 +1680,9 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         }
 
-        let scale = self.scale.fractional_scale();
-        let gap = self.workspace_gap(self.overview_zoom());
-
-        self.workspaces_with_render_geo().find_map(|(ws, geo)| {
-            // Empty workspaces are cleaned up automatically, so there's no point in moving them.
-            if !ws.has_windows_or_name() {
-                return None;
-            }
-
-            let (hit, _) = workspace_handle_geo(geo, gap, scale);
-            hit.contains(pos_within_output).then_some(ws)
-        })
+        // Empty workspaces are cleaned up automatically, so there's no point in moving them.
+        let (ws, _geo) = self.workspace_under(pos_within_output)?;
+        ws.has_windows_or_name().then_some(ws)
     }
 
     /// Returns the index to insert a dragged workspace at, given the pointer position.
@@ -2031,45 +1975,6 @@ impl<W: LayoutElement> Monitor<W> {
         });
     }
 
-    /// Renders the handle of a workspace being dragged in the overview.
-    pub(super) fn render_dragged_workspace_handle<R: NiriRenderer>(
-        &self,
-        ws: &Workspace<W>,
-        location: Point<f64, Logical>,
-        renderer: &mut R,
-        push: &mut dyn FnMut(MonitorRenderElement<R>),
-    ) {
-        if !ws.has_windows_or_name() {
-            return;
-        }
-
-        let scale = self.scale.fractional_scale();
-        let gap = self.workspace_gap(self.overview_zoom());
-        let geo = self.dragged_workspace_geo(location);
-
-        let (_, handle) = workspace_handle_geo(geo, gap, scale);
-        ws.render_handle(renderer, handle.loc, &mut |elem| {
-            let elem = MonitorInnerRenderElement::UncroppedInsertHint(elem);
-            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-            let elem =
-                RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
-            push(elem);
-        });
-    }
-
-    /// Returns the size, scale and alpha to update a dragged workspace's handle with.
-    pub(super) fn dragged_handle_params(&self) -> (Size<f64, Logical>, f64, f32) {
-        let scale = self.scale.fractional_scale();
-        let gap = self.workspace_gap(self.overview_zoom());
-        let geo = Rectangle::from_size(self.workspace_size(self.overview_zoom()));
-        let (_, handle) = workspace_handle_geo(geo, gap, scale);
-        let alpha = self
-            .overview_progress
-            .as_ref()
-            .map_or(1., |p| p.clamped_value().clamp(0., 1.)) as f32;
-        (handle.size, scale, alpha)
-    }
-
     /// Returns the geometry of a workspace being dragged in the overview.
     pub(super) fn dragged_workspace_geo(
         &self,
@@ -2078,35 +1983,6 @@ impl<W: LayoutElement> Monitor<W> {
         let scale = self.scale.fractional_scale();
         let loc = location.to_physical_precise_round(scale).to_logical(scale);
         Rectangle::new(loc, self.workspace_size(self.overview_zoom()))
-    }
-
-    pub fn render_workspace_handles<R: NiriRenderer>(
-        &self,
-        renderer: &mut R,
-        push: &mut dyn FnMut(MonitorRenderElement<R>),
-    ) {
-        if self.overview_progress.is_none() {
-            return;
-        }
-
-        let scale = self.scale.fractional_scale();
-        let gap = self.workspace_gap(self.overview_zoom());
-
-        for (ws, geo) in self.workspaces_with_render_geo() {
-            // The handle of the dragged workspace moves with it.
-            if !ws.has_windows_or_name() || Some(ws.id()) == self.dragged_workspace {
-                continue;
-            }
-
-            let (_, handle) = workspace_handle_geo(geo, gap, scale);
-            ws.render_handle(renderer, handle.loc, &mut |elem| {
-                let elem = MonitorInnerRenderElement::UncroppedInsertHint(elem);
-                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-                let elem =
-                    RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
-                push(elem);
-            });
-        }
     }
 
     pub fn render_workspace_shadows<R: NiriRenderer>(

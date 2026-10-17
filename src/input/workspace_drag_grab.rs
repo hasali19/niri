@@ -21,7 +21,7 @@ use crate::input::AnyStartData;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
 
-/// Grab for dragging a workspace by its handle in the overview.
+/// Grab for dragging a workspace in the overview.
 pub struct WorkspaceDragGrab {
     start_data: AnyStartData<State>,
     cancelled: bool,
