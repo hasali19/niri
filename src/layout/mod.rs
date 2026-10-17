@@ -361,7 +361,7 @@ pub struct Layout<W: LayoutElement> {
     interactive_move: Option<InteractiveMoveState<W>>,
     /// Ongoing drag-and-drop operation.
     dnd: Option<DndData<W>>,
-    /// Ongoing drag of a workspace by its handle in the overview.
+    /// Ongoing drag of a workspace in the overview.
     workspace_drag: Option<WorkspaceDrag>,
     /// Animation of a just dropped workspace.
     workspace_drop_anim: Option<WorkspaceDropAnim>,
@@ -2943,17 +2943,10 @@ impl<W: LayoutElement> Layout<W> {
             // The dragged workspace may be off-screen or on a different monitor, so update its
             // elements explicitly.
             let is_active = self.is_active;
-            let handle_params = drag_output
-                .and_then(|output| self.monitor_for_output(&output))
-                .map(|mon| mon.dragged_handle_params());
             if let Some(ws_id) = self.dragged_workspace_id() {
                 if let Some(ws) = self.workspaces_mut().find(|ws| ws.id() == ws_id) {
                     ws.update_render_elements(is_active, RenderLayer::MovingBetweenWorkspaces);
                     ws.update_render_elements(is_active, RenderLayer::Normal);
-
-                    if let Some((size, scale, alpha)) = handle_params {
-                        ws.update_handle(size, true, scale, alpha);
-                    }
                 }
             }
         }
@@ -4561,8 +4554,8 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    /// Returns the workspace whose overview drag handle is under the position.
-    pub fn workspace_handle_under(
+    /// Returns the workspace under the specified position.
+    pub fn draggable_workspace_under(
         &self,
         output: &Output,
         pos_within_output: Point<f64, Logical>,
@@ -4572,7 +4565,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let mon = self.monitor_for_output(output)?;
-        Some(mon.workspace_handle_under(pos_within_output)?.id())
+        Some(mon.draggable_workspace_under(pos_within_output)?.id())
     }
 
     pub fn workspace_drag_begin(
@@ -4797,21 +4790,6 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         mon.render_dragged_workspace(ws, location, ctx, focus_ring, push);
-    }
-
-    pub fn render_workspace_drag_handle_for_output<R: NiriRenderer>(
-        &self,
-        renderer: &mut R,
-        output: &Output,
-        push: &mut dyn FnMut(MonitorRenderElement<R>),
-    ) {
-        let Some(WorkspaceDragRender { mon, ws, location }) =
-            self.workspace_drag_render_location(output)
-        else {
-            return;
-        };
-
-        mon.render_dragged_workspace_handle(ws, location, renderer, push);
     }
 
     pub fn render_workspace_drag_background_for_output<R: NiriRenderer>(

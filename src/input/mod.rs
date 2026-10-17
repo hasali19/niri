@@ -137,13 +137,14 @@ impl<D: SeatHandler + TabletSeatHandler> AnyStartData<D> {
 }
 
 impl State {
-    /// Starts dragging a workspace if there's a workspace handle under `pos` in the overview.
+    /// Starts dragging a workspace if there's a draggable workspace under the start position in
+    /// the overview.
     fn try_workspace_drag_grab(
         &mut self,
         start_data: AnyStartData<State>,
     ) -> Option<WorkspaceDragGrab> {
         let (output, pos_within_output, ws_id) =
-            self.niri.workspace_handle_under(start_data.location())?;
+            self.niri.draggable_workspace_under(start_data.location())?;
         WorkspaceDragGrab::new(self, start_data, output, pos_within_output, ws_id)
     }
 
@@ -2920,7 +2921,12 @@ impl State {
 
             let is_overview_open = self.niri.layout.is_overview_open();
 
-            if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Left) {
+            // Holding Mod in the overview drags the entire workspace.
+            if is_overview_open
+                && mod_down
+                && !pointer.is_grabbed()
+                && button == Some(MouseButton::Left)
+            {
                 let start_data = PointerGrabStartData {
                     focus: None,
                     button: button_code,
@@ -3816,7 +3822,7 @@ impl State {
                                 self.niri.cancel_mru();
                             }
                         }
-                    } else if let Some(grab) = (!tool.is_grabbed() && !mod_down)
+                    } else if let Some(grab) = (!tool.is_grabbed() && mod_down)
                         .then(|| {
                             let start_data = TabletToolGrabStartData {
                                 focus: None,
@@ -4443,7 +4449,7 @@ impl State {
                     self.niri.cancel_mru();
                 }
             }
-        } else if let Some(grab) = (!handle.is_grabbed() && !mod_down)
+        } else if let Some(grab) = (!handle.is_grabbed() && mod_down)
             .then(|| {
                 let start_data = TouchGrabStartData {
                     focus: None,

@@ -3888,19 +3888,19 @@ fn workspace_drag_reorders_in_overview() {
     let mon = &monitors[0];
     let output = mon.output().clone();
 
-    // Grab the handle of the second workspace (which is centered).
+    // Any point on the second workspace, which is centered, can start the drag.
     let geos: Vec<_> = mon.workspaces_with_render_geo_cull(false).collect();
     let geo = geos[1].1;
-    let handle_pos = Point::from((geo.loc.x + geo.size.w / 2., geo.loc.y - 1.));
+    let grab_pos = Point::from((geo.loc.x + geo.size.w / 2., geo.loc.y + geo.size.h / 2.));
     assert_eq!(
-        layout.workspace_handle_under(&output, handle_pos),
+        layout.draggable_workspace_under(&output, grab_pos),
         Some(ids[1])
     );
 
-    // The empty workspace has no handle.
+    // The empty workspace cannot be dragged.
     let geo = geos[3].1;
-    let handle_pos = Point::from((geo.loc.x + geo.size.w / 2., geo.loc.y - 1.));
-    assert_eq!(layout.workspace_handle_under(&output, handle_pos), None);
+    let empty_pos = Point::from((geo.loc.x + geo.size.w / 2., geo.loc.y + geo.size.h / 2.));
+    assert_eq!(layout.draggable_workspace_under(&output, empty_pos), None);
 
     // Drag it above the first workspace.
     let top = geos[0].1.loc.y + 1.;
