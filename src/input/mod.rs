@@ -42,6 +42,7 @@ use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::virtual_keyboard::VirtualKeyboardDevice;
 use touch_overview_grab::TouchOverviewGrab;
+use workspace_drag_grab::WorkspaceDragGrab;
 
 use self::move_grab::MoveGrab;
 use self::pick_color_grab::PickColorGrab;
@@ -69,6 +70,7 @@ pub mod scroll_tracker;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
 pub mod touch_overview_grab;
+pub mod workspace_drag_grab;
 
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
@@ -135,6 +137,17 @@ impl<D: SeatHandler + TabletSeatHandler> AnyStartData<D> {
 }
 
 impl State {
+    /// Starts dragging a workspace if there's a draggable workspace under the start position in
+    /// the overview.
+    fn try_workspace_drag_grab(
+        &mut self,
+        start_data: AnyStartData<State>,
+    ) -> Option<WorkspaceDragGrab> {
+        let (output, pos_within_output, ws_id) =
+            self.niri.draggable_workspace_under(start_data.location())?;
+        WorkspaceDragGrab::new(self, start_data, output, pos_within_output, ws_id)
+    }
+
     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
     where
         I::Device: 'static, // Needed for downcasting.
@@ -2908,6 +2921,24 @@ impl State {
 
             let is_overview_open = self.niri.layout.is_overview_open();
 
+            // Holding Mod in the overview drags the entire workspace.
+            if is_overview_open
+                && mod_down
+                && !pointer.is_grabbed()
+                && button == Some(MouseButton::Left)
+            {
+                let start_data = PointerGrabStartData {
+                    focus: None,
+                    button: button_code,
+                    location: pointer.current_location(),
+                };
+                let start_data = AnyStartData::Pointer(start_data);
+                if let Some(grab) = self.try_workspace_drag_grab(start_data) {
+                    pointer.set_grab(self, grab, serial, Focus::Clear);
+                    return;
+                }
+            }
+
             if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
                 if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
                     let ws_id = ws.id();
@@ -3791,6 +3822,18 @@ impl State {
                                 self.niri.cancel_mru();
                             }
                         }
+                    } else if let Some(grab) = (!tool.is_grabbed() && mod_down)
+                        .then(|| {
+                            let start_data = TabletToolGrabStartData {
+                                focus: None,
+                                trigger: tablet::tool::GrabTrigger::Tip,
+                                location: pos,
+                            };
+                            self.try_workspace_drag_grab(AnyStartData::TabletTool(start_data))
+                        })
+                        .flatten()
+                    {
+                        tool.set_grab(self, grab, time, serial, Focus::Clear);
                     } else if !tool.is_grabbed() {
                         if under.overview && !mod_down && under.output.is_some() {
                             let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
@@ -4406,6 +4449,18 @@ impl State {
                     self.niri.cancel_mru();
                 }
             }
+        } else if let Some(grab) = (!handle.is_grabbed() && mod_down)
+            .then(|| {
+                let start_data = TouchGrabStartData {
+                    focus: None,
+                    slot,
+                    location: pos,
+                };
+                self.try_workspace_drag_grab(AnyStartData::Touch(start_data))
+            })
+            .flatten()
+        {
+            handle.set_grab(self, grab, serial);
         } else if !handle.is_grabbed() {
             if under.overview && !mod_down && under.output.is_some() {
                 let (output, pos_within_output) = self.niri.output_under(pos).unwrap();

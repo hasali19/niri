@@ -9,6 +9,7 @@ use niri_config::{
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::Color32F;
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -94,6 +95,9 @@ pub struct Workspace<W: LayoutElement> {
 
     /// This workspace's background.
     background_buffer: SolidColorBuffer,
+
+    /// Translucent placeholder left in place of the workspace while it is being dragged.
+    placeholder_buffer: SolidColorBuffer,
 
     /// Clock for driving animations.
     pub(super) clock: Clock,
@@ -269,6 +273,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
+            placeholder_buffer: SolidColorBuffer::default(),
             output: Some(output),
             clock,
             base_options,
@@ -332,6 +337,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_buffer: SolidColorBuffer::new(view_size, options.layout.background_color),
+            placeholder_buffer: SolidColorBuffer::default(),
             clock,
             base_options,
             options,
@@ -1704,6 +1710,19 @@ impl<W: LayoutElement> Workspace<W> {
         push: &mut dyn FnMut(ShadowRenderElement),
     ) {
         self.shadow.render(renderer, Point::from((0., 0.)), push);
+    }
+
+    pub fn update_placeholder(&mut self, size: Size<f64, Logical>, color: Color32F) {
+        self.placeholder_buffer.update(size, color);
+    }
+
+    pub fn render_placeholder(&self) -> SolidColorRenderElement {
+        SolidColorRenderElement::from_buffer(
+            &self.placeholder_buffer,
+            Point::new(0., 0.),
+            1.,
+            Kind::Unspecified,
+        )
     }
 
     pub fn render_background(&self) -> SolidColorRenderElement {
