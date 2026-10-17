@@ -86,10 +86,8 @@ Requires:       mesa-libEGL
 # Loaded through dlopen
 Requires:       libwayland-server
 
-# Integrated Xwayland support. Not packaged on EPEL
-%if 0%{?fedora}
+# Integrated Xwayland support
 Requires:       xwayland-satellite >= 0.7
-%endif
 
 # Portal implementations used by niri
 Recommends:     xdg-desktop-portal-gtk
