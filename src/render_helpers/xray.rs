@@ -93,6 +93,19 @@ impl Xray {
         }
     }
 
+    /// Returns a copy that shares the buffers but has a different set of workspaces.
+    ///
+    /// For rendering things that are not at the same place as the workspaces the xray was set up
+    /// with, e.g. a workspace being dragged in the overview.
+    pub fn with_workspaces(&self, workspaces: Vec<(Rectangle<f64, Logical>, Color32F)>) -> Self {
+        Self {
+            background: self.background.clone(),
+            backdrop: self.backdrop.clone(),
+            backdrop_color: self.backdrop_color,
+            workspaces,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
