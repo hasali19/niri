@@ -295,23 +295,27 @@ impl Session {
     ) -> fdo::Result<OwnedObjectPath> {
         debug!(connector, ?properties, "record_monitor");
 
-        let connector = if connector.is_empty() {
-            let new_connector = "DP-2";
-            warn!("Replacing connector={connector:?} with connector={new_connector:?} for gnome-remote-desktop");
-            new_connector
-            // FIXME: HACK: remove this!!
-        } else {
-            connector
-        };
-
         let output = {
             let ipc_outputs = self.ipc_outputs.lock().unwrap();
-            ipc_outputs.values().find(|o| o.name == connector).cloned()
+            if connector.is_empty() {
+                // An empty connector means "the primary monitor" (gnome-remote-desktop relies on
+                // this). niri has no primary monitor, so pick the enabled output that is
+                // left-most, then top-most, in the global layout.
+                ipc_outputs
+                    .values()
+                    .filter_map(|o| o.logical.map(|logical| (logical.x, logical.y, o)))
+                    .min_by_key(|(x, y, o)| (*x, *y, o.name.clone()))
+                    .map(|(_, _, o)| o.clone())
+            } else {
+                ipc_outputs.values().find(|o| o.name == connector).cloned()
+            }
         };
         let Some(output) = output else {
-            return Err(fdo::Error::Failed(format!(
-                "No such monitor with connector/name: {connector}"
-            )));
+            return Err(fdo::Error::Failed(if connector.is_empty() {
+                "No enabled monitors".to_owned()
+            } else {
+                format!("No such monitor with connector/name: {connector}")
+            }));
         };
 
         if output.logical.is_none() {
