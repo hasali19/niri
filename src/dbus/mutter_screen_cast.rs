@@ -44,6 +44,8 @@ pub enum StopCastReason {
 #[derive(Clone)]
 pub struct ScreenCast {
     ipc_outputs: Arc<StdMutex<IpcOutputMap>>,
+    /// Whether virtual monitors (`RecordVirtual`) are supported.
+    supports_virtual: bool,
     to_niri: calloop::channel::Sender<ScreenCastToNiri>,
     #[cfg(feature = "xdp-gnome-remote-desktop")]
     remote_desktop_shared: Arc<Mutex<RemoteDesktopShared>>,
@@ -126,6 +128,7 @@ impl ScreenCast {
         let session = Session {
             id: session_id,
             ipc_outputs: self.ipc_outputs.clone(),
+            supports_virtual: self.supports_virtual,
             streams: Arc::new(Mutex::new(vec![])),
             to_niri: self.to_niri.clone(),
             stopped: Arc::new(AtomicBool::new(false)),
@@ -170,6 +173,7 @@ impl ScreenCast {
 impl ScreenCast {
     pub fn new(
         ipc_outputs: Arc<StdMutex<IpcOutputMap>>,
+        supports_virtual: bool,
         to_niri: calloop::channel::Sender<ScreenCastToNiri>,
         #[cfg(feature = "xdp-gnome-remote-desktop")] remote_desktop_shared: Arc<
             Mutex<RemoteDesktopShared>,
@@ -180,6 +184,7 @@ impl ScreenCast {
     ) -> Self {
         Self {
             ipc_outputs,
+            supports_virtual,
             to_niri,
             #[cfg(feature = "xdp-gnome-remote-desktop")]
             remote_desktop_shared,
@@ -206,6 +211,7 @@ impl Start for ScreenCast {
 pub struct Session {
     id: CastSessionId,
     pub ipc_outputs: Arc<StdMutex<IpcOutputMap>>,
+    supports_virtual: bool,
     to_niri: calloop::channel::Sender<ScreenCastToNiri>,
     #[allow(clippy::type_complexity)]
     streams: Arc<Mutex<Vec<InterfaceRef<Stream>>>>,
@@ -233,6 +239,18 @@ struct RecordMonitorProperties {
     cursor_mode: Option<CursorMode>,
     #[zvariant(rename = "is-recording")]
     _is_recording: Option<bool>,
+}
+
+#[derive(Debug, DeserializeDict, Type)]
+#[zvariant(signature = "dict")]
+struct RecordVirtualProperties {
+    #[zvariant(rename = "cursor-mode")]
+    cursor_mode: Option<CursorMode>,
+    #[zvariant(rename = "is-recording")]
+    _is_recording: Option<bool>,
+    /// Whether the virtual monitor should act like a regular monitor. niri always does that.
+    #[zvariant(rename = "is-platform")]
+    _is_platform: Option<bool>,
 }
 
 #[derive(Debug, DeserializeDict, Type)]
@@ -344,6 +362,31 @@ impl Session {
         self.record_shared(target, cursor_mode, server).await
     }
 
+    /// Creates a [`Stream`] that records a new virtual monitor.
+    ///
+    /// The virtual monitor gets created when the stream starts, with the size that the PipeWire
+    /// consumer picks, and gets removed when the stream stops.
+    async fn record_virtual(
+        &mut self,
+        #[zbus(object_server)] server: &ObjectServer,
+        properties: RecordVirtualProperties,
+    ) -> fdo::Result<OwnedObjectPath> {
+        debug!(?properties, "record_virtual");
+
+        if !self.supports_virtual {
+            return Err(fdo::Error::NotSupported(
+                "Virtual monitors are only supported when running niri --headless".to_owned(),
+            ));
+        }
+
+        let target = StreamTarget::Virtual {
+            name: crate::backend::headless::next_virtual_output_name(),
+        };
+        let cursor_mode = properties.cursor_mode.unwrap_or_default();
+
+        self.record_shared(target, cursor_mode, server).await
+    }
+
     /// Event that the session has closed.
     #[zbus(signal)]
     async fn closed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
@@ -447,6 +490,7 @@ impl Session {
             target,
             cursor_mode,
             was_started: Arc::new(AtomicBool::new(false)),
+            ipc_outputs: self.ipc_outputs.clone(),
             to_niri: self.to_niri.clone(),
             #[cfg(feature = "xdp-gnome-remote-desktop")]
             has_remote_desktop_session: self.rd_session.is_some(),
@@ -488,6 +532,7 @@ pub struct Stream {
     target: StreamTarget,
     cursor_mode: CursorMode,
     was_started: Arc<AtomicBool>,
+    ipc_outputs: Arc<StdMutex<IpcOutputMap>>,
     to_niri: calloop::channel::Sender<ScreenCastToNiri>,
     #[cfg(feature = "xdp-gnome-remote-desktop")]
     has_remote_desktop_session: bool,
@@ -497,7 +542,13 @@ pub struct Stream {
 enum StreamTarget {
     // FIXME: update on scale changes and whatnot.
     Output(niri_ipc::Output),
-    Window { id: u64 },
+    Window {
+        id: u64,
+    },
+    /// A virtual output that gets created for this stream.
+    Virtual {
+        name: String,
+    },
 }
 
 impl StreamTarget {
@@ -507,6 +558,7 @@ impl StreamTarget {
                 name: output.name.clone(),
             },
             StreamTarget::Window { id } => StreamTargetId::Window { id: *id },
+            StreamTarget::Virtual { name } => StreamTargetId::Virtual { name: name.clone() },
         }
     }
 }
@@ -515,6 +567,7 @@ impl StreamTarget {
 pub enum StreamTargetId {
     Output { name: String },
     Window { id: u64 },
+    Virtual { name: String },
 }
 
 #[derive(Debug, SerializeDict, Type, Value)]
@@ -559,6 +612,27 @@ impl Stream {
                     size: (1, 1),
                     // TODO: does anyone need to remote-desktop to
                     // a specific window?
+                    mapping_id: None,
+                }
+            }
+            StreamTarget::Virtual { name } => {
+                // The output only exists once the stream has started.
+                let ipc_outputs = self.ipc_outputs.lock().unwrap();
+                let logical = ipc_outputs
+                    .values()
+                    .find(|o| &o.name == name)
+                    .and_then(|o| o.logical);
+                let (position, size) = logical
+                    .map(|l| ((l.x, l.y), (l.width as i32, l.height as i32)))
+                    .unwrap_or_default();
+
+                StreamParameters {
+                    position,
+                    size,
+                    // The output name is used as its EI region mapping ID.
+                    #[cfg(feature = "xdp-gnome-remote-desktop")]
+                    mapping_id: self.has_remote_desktop_session.then(|| name.clone()),
+                    #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
                     mapping_id: None,
                 }
             }

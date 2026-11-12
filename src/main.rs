@@ -188,11 +188,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_loop.handle(),
         event_loop.get_signal(),
         display,
-        false,
+        cli.headless,
         true,
         cli.session,
     )
     .unwrap();
+
+    if cli.headless {
+        info!("running headless");
+        state
+            .backend
+            .headless()
+            .start_session(&mut state.niri)
+            .map_err(|err| err.context("error starting the headless session"))?;
+    }
 
     // Set WAYLAND_DISPLAY for children.
     let socket_name = state.niri.socket_name.as_deref().unwrap();

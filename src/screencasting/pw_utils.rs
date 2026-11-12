@@ -69,6 +69,8 @@ use shm_mapping::ShmMapping;
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
+/// Largest size a consumer can pick for a consumer-sized cast.
+const MAX_CONSUMER_SIZE: u32 = 16384;
 
 const CURSOR_FORMAT: spa_video_format = SPA_VIDEO_FORMAT_BGRA;
 const CURSOR_BPP: u32 = 4;
@@ -89,8 +91,17 @@ pub struct PipeWire {
 }
 
 pub enum PwToNiri {
-    StopCast { session_id: CastSessionId },
-    Redraw { stream_id: CastStreamId },
+    StopCast {
+        session_id: CastSessionId,
+    },
+    Redraw {
+        stream_id: CastStreamId,
+    },
+    /// The consumer of a consumer-sized cast picked a new size.
+    ResizeTarget {
+        stream_id: CastStreamId,
+        size: Size<i32, Physical>,
+    },
     FatalError,
 }
 
@@ -103,8 +114,15 @@ pub struct Cast {
     pub stream: StreamRc,
     pub target: CastTarget,
     pub dynamic_target: bool,
+    /// Virtual output created for this cast, removed when the cast stops.
+    pub virtual_output: Option<Output>,
     formats: FormatSet,
     offer_alpha: bool,
+    /// Whether the consumer picks the size of the cast, and the target follows.
+    ///
+    /// This is the case for virtual outputs created for the cast (for example, for a remote
+    /// desktop client's monitor). For regular casts, the size follows the target instead.
+    consumer_sized: bool,
     cursor_mode: CursorMode,
     last_frame_time: Duration,
     last_frame_interval: Duration,
@@ -227,10 +245,29 @@ fn make_video_params(
     modifiers: &[Modifier],
     size: Size<u32, Physical>,
     refresh: u32,
+    consumer_sized: bool,
 ) -> pod::Object {
-    let mut properties = vec![
-        pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
-        pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+    let size_property = if consumer_sized {
+        // Let the consumer pick any size, preferring the current one.
+        pod::property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            Rectangle {
+                width: size.w,
+                height: size.h,
+            },
+            Rectangle {
+                width: 1,
+                height: 1,
+            },
+            Rectangle {
+                width: MAX_CONSUMER_SIZE,
+                height: MAX_CONSUMER_SIZE,
+            }
+        )
+    } else {
         pod::property!(
             FormatProperties::VideoSize,
             Rectangle,
@@ -238,7 +275,13 @@ fn make_video_params(
                 width: size.w,
                 height: size.h,
             }
-        ),
+        )
+    };
+
+    let mut properties = vec![
+        pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        size_property,
         pod::property!(
             FormatProperties::VideoFramerate,
             Fraction,
@@ -301,6 +344,7 @@ fn make_initial_video_params(
     size: Size<u32, Physical>,
     refresh: u32,
     alpha: bool,
+    consumer_sized: bool,
 ) -> Vec<pod::Object> {
     let mut rv = Vec::new();
 
@@ -325,9 +369,21 @@ fn make_initial_video_params(
         trace!("offering: {modifiers:?}");
 
         if !modifiers.is_empty() {
-            rv.push(make_video_params(format, &modifiers, size, refresh));
+            rv.push(make_video_params(
+                format,
+                &modifiers,
+                size,
+                refresh,
+                consumer_sized,
+            ));
         }
-        rv.push(make_video_params(format, &[], size, refresh));
+        rv.push(make_video_params(
+            format,
+            &[],
+            size,
+            refresh,
+            consumer_sized,
+        ));
     };
 
     if alpha {
@@ -339,8 +395,8 @@ fn make_initial_video_params(
 }
 
 macro_rules! make_params {
-    ($params:ident, $formats:expr, $size:expr, $refresh:expr, $alpha:expr) => {
-        let $params = make_initial_video_params($formats, $size, $refresh, $alpha);
+    ($params:ident, $formats:expr, $size:expr, $refresh:expr, $alpha:expr, $consumer_sized:expr) => {
+        let $params = make_initial_video_params($formats, $size, $refresh, $alpha, $consumer_sized);
         let mut bufs = [const { Vec::new() }; 4]; // Maximum possible params len.
         let mut $params: Vec<_> = $params
             .into_iter()
@@ -409,6 +465,7 @@ impl PipeWire {
         size: Size<i32, Physical>,
         refresh: u32,
         alpha: bool,
+        consumer_sized: bool,
         mut cursor_mode: CursorMode,
         signal_ctx: SignalEmitter<'static>,
     ) -> anyhow::Result<Cast> {
@@ -428,6 +485,13 @@ impl PipeWire {
             }
         };
         let redraw_ = redraw.clone();
+        let to_niri_ = self.to_niri.clone();
+        let resize_target = move |size: Size<u32, Physical>| {
+            let size = Size::from((size.w as i32, size.h as i32));
+            if let Err(err) = to_niri_.send(PwToNiri::ResizeTarget { stream_id, size }) {
+                warn!("error sending ResizeTarget to niri: {err:?}");
+            }
+        };
 
         let stream = StreamRc::new(
             self.core.clone(),
@@ -554,7 +618,15 @@ impl PipeWire {
                         let format_size = Size::from((format.size().width, format.size().height));
 
                         let state = &mut inner.state;
-                        if format_size != state.expected_format_size() {
+                        if consumer_sized && format_size != state.expected_format_size() {
+                            // The consumer picked a size. Go along with it, and resize the target
+                            // to match.
+                            debug!("consumer picked size {format_size:?}, resizing target");
+                            *state = CastState::ResizePending {
+                                pending_size: format_size,
+                            };
+                            resize_target(format_size);
+                        } else if format_size != state.expected_format_size() {
                             if !matches!(&*state, CastState::ResizePending { .. }) {
                                 warn!("wrong size, but we're not resizing");
                                 stop_cast();
@@ -662,6 +734,7 @@ impl PipeWire {
                                     &[modifier],
                                     format_size,
                                     inner.refresh,
+                                    consumer_sized,
                                 );
                                 let mut b = Vec::new();
                                 let pod = make_pod(&mut b, o);
@@ -671,7 +744,8 @@ impl PipeWire {
                                     &formats,
                                     format_size,
                                     inner.refresh,
-                                    format_has_alpha
+                                    format_has_alpha,
+                                    consumer_sized
                                 );
                                 params.insert(0, pod);
 
@@ -925,7 +999,14 @@ impl PipeWire {
 
         trace!("starting pw stream with size={pending_size:?}, refresh={refresh:?}");
 
-        make_params!(params, &formats, pending_size, refresh, alpha);
+        make_params!(
+            params,
+            &formats,
+            pending_size,
+            refresh,
+            alpha,
+            consumer_sized
+        );
         stream
             .connect(
                 Direction::Output,
@@ -943,8 +1024,10 @@ impl PipeWire {
             _listener: listener,
             target,
             dynamic_target: false,
+            virtual_output: None,
             formats,
             offer_alpha: alpha,
+            consumer_sized,
             cursor_mode,
             last_frame_time: Duration::ZERO,
             last_frame_interval: Duration::ZERO,
@@ -975,6 +1058,12 @@ impl Cast {
             return Ok(CastSizeChange::Ready);
         }
 
+        if self.consumer_sized {
+            // The target is being resized to match the consumer; wait for it rather than
+            // renegotiating the size.
+            return Ok(CastSizeChange::Pending);
+        }
+
         if state.pending_size() == Some(new_size) {
             debug!("stream size still hasn't changed, skipping frame");
             return Ok(CastSizeChange::Pending);
@@ -992,7 +1081,8 @@ impl Cast {
             &self.formats,
             new_size,
             inner.refresh,
-            self.offer_alpha
+            self.offer_alpha,
+            self.consumer_sized
         );
         self.stream
             .update_params(&mut params)
@@ -1013,7 +1103,14 @@ impl Cast {
         inner.refresh = refresh;
 
         let size = inner.state.expected_format_size();
-        make_params!(params, &self.formats, size, refresh, self.offer_alpha);
+        make_params!(
+            params,
+            &self.formats,
+            size,
+            refresh,
+            self.offer_alpha,
+            self.consumer_sized
+        );
         self.stream
             .update_params(&mut params)
             .context("error updating stream params")?;

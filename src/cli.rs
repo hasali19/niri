@@ -26,6 +26,12 @@ pub struct Cli {
     /// on a TTY as your non-main compositor instance, to avoid messing up the global environment.
     #[arg(long)]
     pub session: bool,
+    /// Run without physical monitors or input devices.
+    ///
+    /// Monitors get created on demand by remote desktop servers such as gnome-remote-desktop, and
+    /// input comes from remote desktop sessions.
+    #[arg(long)]
+    pub headless: bool,
     /// Command to run upon compositor startup.
     #[arg(last = true)]
     pub command: Vec<OsString>,

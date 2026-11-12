@@ -830,6 +830,9 @@ impl State {
     pub fn refresh_and_flush_clients(&mut self) {
         let _span = tracy_client::span!("State::refresh_and_flush_clients");
 
+        #[cfg(feature = "xdp-gnome-screencast")]
+        self.remove_stopped_virtual_outputs();
+
         self.refresh();
 
         // Advance animations to the current time (not target render time) before rendering outputs

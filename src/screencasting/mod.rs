@@ -15,6 +15,7 @@ use smithay::reexports::gbm::Modifier;
 use smithay::utils::{DeviceFd, Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
+use crate::backend::Backend;
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
@@ -23,6 +24,9 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
+
+/// Size of a new virtual output before the PipeWire consumer picks one.
+const DEFAULT_VIRTUAL_OUTPUT_SIZE: (i32, i32) = (1920, 1080);
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
 
 pub struct Screencasting {
@@ -38,6 +42,9 @@ pub struct Screencasting {
 
     /// Window ID for the "dynamic cast" special window for the xdp-gnome picker.
     pub dynamic_cast_id_for_portal: MappedId,
+
+    /// Virtual outputs of stopped casts, waiting to be removed.
+    pub virtual_outputs_to_remove: Vec<Output>,
 
     // Drop PipeWire last, and specifically after casts, to prevent a double-free (yay).
     pub pipewire: Option<PipeWire>,
@@ -70,6 +77,7 @@ impl Screencasting {
             pw_to_niri,
             mapped_cast_output: HashMap::new(),
             dynamic_cast_id_for_portal: MappedId::next(),
+            virtual_outputs_to_remove: Vec::new(),
             pipewire: None,
         }
     }
@@ -120,6 +128,7 @@ impl State {
         match msg {
             PwToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
             PwToNiri::Redraw { stream_id } => self.redraw_cast(stream_id),
+            PwToNiri::ResizeTarget { stream_id, size } => self.resize_cast_target(stream_id, size),
             PwToNiri::FatalError => {
                 warn!("stopping PipeWire due to fatal error");
                 let casting = &mut self.niri.casting;
@@ -365,6 +374,7 @@ impl State {
                 size,
                 refresh,
                 alpha,
+                false,
                 pending.cursor_mode,
                 pending.signal_ctx,
             );
@@ -385,6 +395,39 @@ impl State {
         }
     }
 
+    fn resize_cast_target(&mut self, stream_id: CastStreamId, size: Size<i32, Physical>) {
+        let cast = self
+            .niri
+            .casting
+            .casts
+            .iter()
+            .find(|c| c.stream_id == stream_id);
+        let Some(output) = cast.and_then(|cast| cast.virtual_output.clone()) else {
+            warn!("consumer-sized cast has no virtual output to resize");
+            return;
+        };
+
+        let Backend::Headless(headless) = &mut self.backend else {
+            return;
+        };
+        headless.resize_virtual_output(&mut self.niri, &output, size);
+    }
+
+    /// Removes the virtual outputs of casts that have stopped.
+    pub fn remove_stopped_virtual_outputs(&mut self) {
+        let outputs = mem::take(&mut self.niri.casting.virtual_outputs_to_remove);
+        if outputs.is_empty() {
+            return;
+        }
+
+        let Backend::Headless(headless) = &mut self.backend else {
+            return;
+        };
+        for output in outputs {
+            headless.remove_virtual_output(&mut self.niri, &output);
+        }
+    }
+
     pub fn on_screen_cast_msg(&mut self, msg: ScreenCastToNiri) {
         match msg {
             ScreenCastToNiri::StartStream {
@@ -397,6 +440,7 @@ impl State {
                 let _span = tracy_client::span!("StartStream");
                 let _span = debug_span!("StartStream", %session_id, %stream_id).entered();
 
+                let mut virtual_output = None;
                 let (target, size, refresh, alpha) = match target {
                     StreamTargetId::Output { name } => {
                         let global_space = &self.niri.global_space;
@@ -430,12 +474,45 @@ impl State {
                         };
                         (CastTarget::Window { id }, size, refresh, true)
                     }
+                    StreamTargetId::Virtual { name } => {
+                        let Backend::Headless(headless) = &mut self.backend else {
+                            warn!(
+                                "error starting screencast stream: virtual outputs need headless"
+                            );
+                            self.niri.stop_cast(session_id);
+                            return;
+                        };
+
+                        // The consumer picks the actual size during negotiation.
+                        let res = headless.add_virtual_output(
+                            &mut self.niri,
+                            name,
+                            Size::from(DEFAULT_VIRTUAL_OUTPUT_SIZE),
+                        );
+                        let output = match res {
+                            Ok(output) => output,
+                            Err(err) => {
+                                warn!("error starting screencast stream: {err:?}");
+                                self.niri.stop_cast(session_id);
+                                return;
+                            }
+                        };
+
+                        let (size, refresh) = cast_params_for_output(&output);
+                        let target = CastTarget::output(&output);
+                        virtual_output = Some(output);
+                        (target, size, refresh, false)
+                    }
                 };
 
                 let gbm = match self.prepare_pw_cast() {
                     Ok(x) => x,
                     Err(err) => {
                         warn!("error starting screencast stream: {err:?}");
+                        self.niri
+                            .casting
+                            .virtual_outputs_to_remove
+                            .extend(virtual_output);
                         self.niri.stop_cast(session_id);
                         return;
                     }
@@ -450,15 +527,21 @@ impl State {
                     size,
                     refresh,
                     alpha,
+                    virtual_output.is_some(),
                     cursor_mode,
                     signal_ctx,
                 );
                 match res {
-                    Ok(cast) => {
+                    Ok(mut cast) => {
+                        cast.virtual_output = virtual_output;
                         self.niri.casting.casts.push(cast);
                     }
                     Err(err) => {
                         warn!("error starting screencast stream: {err:?}");
+                        self.niri
+                            .casting
+                            .virtual_outputs_to_remove
+                            .extend(virtual_output);
                         self.niri.stop_cast(session_id);
                     }
                 }
@@ -727,6 +810,9 @@ impl Niri {
             if let Err(err) = cast.stream.disconnect() {
                 warn!("error disconnecting stream: {err:?}");
             }
+            self.casting
+                .virtual_outputs_to_remove
+                .extend(cast.virtual_output.clone());
         }
 
         let dbus = &self.dbus.as_ref().unwrap();

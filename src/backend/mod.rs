@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,9 +8,11 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
-use crate::niri::Niri;
+use crate::niri::{Niri, RedrawState};
+use crate::utils::get_monotonic_time;
 use crate::utils::id::IdCounter;
 
 pub mod tty;
@@ -106,7 +109,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.render(niri, output, target_presentation_time),
             Backend::Winit(winit) => winit.render(niri, output),
-            Backend::Headless(headless) => headless.render(niri, output),
+            Backend::Headless(headless) => headless.render(niri, output, target_presentation_time),
         }
     }
 
@@ -178,7 +181,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.primary_gbm_device(),
             Backend::Winit(winit) => winit.gbm_device(),
-            Backend::Headless(_) => None,
+            Backend::Headless(headless) => headless.gbm_device(),
         }
     }
 
@@ -251,5 +254,86 @@ impl Backend {
         } else {
             panic!("backend is not Headless")
         }
+    }
+}
+
+/// Queues a timer to fire at the estimated next VBlank of an output.
+///
+/// Backends use this when they didn't submit a frame (for example because there was no damage),
+/// so that frame callbacks keep getting sent at the output's refresh rate.
+fn queue_estimated_vblank_timer(
+    niri: &mut Niri,
+    output: Output,
+    target_presentation_time: Duration,
+) {
+    let output_state = niri.output_state.get_mut(&output).unwrap();
+    match mem::take(&mut output_state.redraw_state) {
+        RedrawState::Idle => unreachable!(),
+        RedrawState::Queued => (),
+        RedrawState::WaitingForVBlank { .. } => unreachable!(),
+        RedrawState::WaitingForEstimatedVBlank(token)
+        | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+            output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+            return;
+        }
+    }
+
+    let now = get_monotonic_time();
+    let mut duration = target_presentation_time.saturating_sub(now);
+
+    // No use setting a zero timer, since we'll send frame callbacks anyway right after the call to
+    // render(). This can happen for example with unknown presentation time from DRM.
+    if duration.is_zero() {
+        duration += output_state
+            .frame_clock
+            .refresh_interval()
+            // Unknown refresh interval, i.e. winit backend. Would be good to estimate it somehow
+            // but it's not that important for this code path.
+            .unwrap_or(Duration::from_micros(16_667));
+    }
+
+    trace!("queueing estimated vblank timer to fire in {duration:?}");
+
+    let timer = Timer::from_duration(duration);
+    let token = niri
+        .event_loop
+        .insert_source(timer, move |_, _, data| {
+            on_estimated_vblank_timer(&mut data.niri, output.clone());
+            TimeoutAction::Drop
+        })
+        .unwrap();
+    output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+}
+
+fn on_estimated_vblank_timer(niri: &mut Niri, output: Output) {
+    let span = tracy_client::span!("on_estimated_vblank_timer");
+
+    let name = output.name();
+    span.emit_text(&name);
+
+    let Some(output_state) = niri.output_state.get_mut(&output) else {
+        error!("missing output state for {name}");
+        return;
+    };
+
+    // We waited for the timer, now we can send frame callbacks again.
+    output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
+
+    match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+        RedrawState::Idle => unreachable!(),
+        RedrawState::Queued => unreachable!(),
+        RedrawState::WaitingForVBlank { .. } => unreachable!(),
+        RedrawState::WaitingForEstimatedVBlank(_) => (),
+        // The timer fired just in front of a redraw.
+        RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
+            output_state.redraw_state = RedrawState::Queued;
+            return;
+        }
+    }
+
+    if output_state.unfinished_animations_remain {
+        niri.queue_redraw(&output);
+    } else {
+        niri.send_frame_callbacks(&output);
     }
 }

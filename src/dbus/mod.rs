@@ -164,8 +164,15 @@ impl DBusServers {
                     })
                     .unwrap();
 
+                let supports_virtual = match backend {
+                    crate::backend::Backend::Headless(headless) => {
+                        headless.supports_virtual_outputs()
+                    }
+                    _ => false,
+                };
                 let screen_cast = ScreenCast::new(
                     backend.ipc_outputs(),
+                    supports_virtual,
                     to_niri,
                     #[cfg(feature = "xdp-gnome-remote-desktop")]
                     remote_desktop_shared,
