@@ -183,18 +183,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Increase the buffer size so that it's harder to crash a frozen client with a 1000 Hz mouse.
     set_default_max_buffer_size(&display, 1024 * 1024);
 
+    // When running as a session, check if the login session has a seat. Sessions without a seat
+    // (such as remote logins through GDM) can't use monitors or input devices, so run headless.
+    #[cfg(feature = "dbus")]
+    let session_info = if cli.session {
+        match dbus::freedesktop_login1::current_session_info() {
+            Ok(info) => {
+                debug!("login session: {info:?}");
+                Some(info)
+            }
+            Err(err) => {
+                debug!("couldn't get login session info: {err:?}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(feature = "dbus")]
+    let headless = cli.headless || session_info.as_ref().is_some_and(|info| !info.has_seat);
+    #[cfg(not(feature = "dbus"))]
+    let headless = cli.headless;
+
+    if headless && !cli.headless {
+        info!("the login session has no seat, running headless");
+    }
+
     let mut state = State::new(
         config,
         event_loop.handle(),
         event_loop.get_signal(),
         display,
-        cli.headless,
+        headless,
         true,
         cli.session,
     )
     .unwrap();
 
-    if cli.headless {
+    if headless {
         info!("running headless");
         state
             .backend
@@ -234,9 +261,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // We're starting as a session. Import our variables.
         import_environment();
 
-        // Inhibit power key handling so we can suspend on it.
+        // Inhibit power key handling so we can suspend on it. Headless sessions have no power key
+        // (and seatless sessions aren't allowed to inhibit it).
         #[cfg(feature = "dbus")]
-        if !state.niri.config.borrow().input.disable_power_key_handling {
+        if !headless && !state.niri.config.borrow().input.disable_power_key_handling {
             if let Err(err) = state.niri.inhibit_power_key() {
                 warn!("error inhibiting power key: {err:?}");
             }
@@ -245,6 +273,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "dbus")]
     dbus::DBusServers::start(&mut state, cli.session);
+
+    // In a remote login, take over the remote desktop connection that the user logged in through.
+    #[cfg(feature = "dbus")]
+    let is_remote_login = headless
+        && session_info
+            .as_ref()
+            .is_some_and(|info| info.remote && info.class == "user");
+    #[cfg(feature = "dbus")]
+    if is_remote_login {
+        info!("remote login, starting gnome-remote-desktop handover");
+        if let Err(err) = dbus::freedesktop_login1::set_remote_desktop_handover_running(true) {
+            warn!("error starting remote desktop handover: {err:?}");
+        }
+    }
 
     #[cfg(feature = "dbus")]
     if cli.session {
@@ -287,6 +329,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .run(None, &mut state, |state| state.refresh_and_flush_clients())
         .unwrap();
+
+    // The handover daemon belongs to this session, so stop it with the session.
+    #[cfg(feature = "dbus")]
+    if is_remote_login {
+        if let Err(err) = dbus::freedesktop_login1::set_remote_desktop_handover_running(false) {
+            warn!("error stopping remote desktop handover: {err:?}");
+        }
+    }
 
     Ok(())
 }

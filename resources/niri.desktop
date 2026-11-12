@@ -3,4 +3,5 @@ Name=Niri
 Comment=A scrollable-tiling Wayland compositor
 Exec=niri-session
 Type=Application
+X-GDM-CanRunHeadless=true
 DesktopNames=niri

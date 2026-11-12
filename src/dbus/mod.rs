@@ -211,7 +211,11 @@ impl DBusServers {
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
-        match freedesktop_login1::start(to_niri) {
+        // When running as a session, quit when our login session goes away.
+        let session_id = is_session_instance
+            .then(|| std::env::var("XDG_SESSION_ID").ok())
+            .flatten();
+        match freedesktop_login1::start(to_niri, session_id) {
             Ok(conn) => {
                 dbus.conn_login1 = Some(conn);
             }
